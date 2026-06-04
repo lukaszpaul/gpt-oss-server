@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 from mlx_lm import load
 from mlx_lm.generate import generate_step
-from mlx_lm.sample_utils import make_sampler
+from mlx_lm.sample_utils import make_sampler, make_logits_processors
 
 from openai_harmony import (
     load_harmony_encoding,
@@ -201,16 +201,30 @@ def run_tokens(body: Dict[str, Any]):
     convo = build_conversation(body)
     prompt_ids = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
 
-    temp = float(body.get("temperature", 1.0) or 0.0)
-    top_p = float(body.get("top_p", 1.0) or 0.0)
+    # gpt-oss is designed for temp=1.0 / top_p=1.0. Greedy or low-temp decoding
+    # makes it degenerate into single-token loops ("timer timer timer..."), and
+    # agent harnesses often request temperature=0. So we default to the
+    # recommended sampling and add a mild repetition penalty as a safety net.
+    # Clients may still override any of these explicitly.
+    temp = body.get("temperature")
+    temp = 1.0 if temp is None else float(temp)
+    top_p = body.get("top_p")
+    top_p = 1.0 if top_p is None else float(top_p)
+    rep = body.get("repetition_penalty")
+    rep = 1.1 if rep is None else float(rep)
+
     sampler = make_sampler(temp=temp, top_p=top_p)
+    logits_processors = make_logits_processors(repetition_penalty=rep)
 
     max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens")
                      or DEFAULT_MAX_TOKENS)
 
     prompt = mx.array(prompt_ids)
     n = 0
-    for token, _logprobs in generate_step(prompt, model, max_tokens=-1, sampler=sampler):
+    for token, _logprobs in generate_step(
+        prompt, model, max_tokens=-1, sampler=sampler,
+        logits_processors=logits_processors,
+    ):
         if token in STOP_IDS:
             break
         yield token
