@@ -29,6 +29,10 @@ import os
 import json
 import time
 import uuid
+import asyncio
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
@@ -62,11 +66,26 @@ MODEL_ID = os.environ.get("GPT_OSS_ID", "gpt-oss-20b")
 PORT = int(os.environ.get("GPT_OSS_PORT", "8000"))
 DEFAULT_MAX_TOKENS = int(os.environ.get("GPT_OSS_MAX_TOKENS", "4096"))
 
-print(f"[gpt-server] loading model from {MODEL_PATH} ...")
-model, _tok = load(MODEL_PATH)                       # _tok unused: harmony owns tokenization
+# All MLX/Metal work MUST run on one consistent thread. Metal command streams
+# are per-thread, so letting generation hop across Starlette's threadpool throws
+# "There is no Stream(gpu, N) in current thread" and kills the response mid-stream
+# (which the client sees as ERR_INCOMPLETE_CHUNKED_ENCODING). We pin every model
+# touch to a single-worker executor; max_workers=1 also serializes overlapping
+# requests, which MLX generation requires anyway.
+GPU = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
+
 enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 STOP_IDS = set(enc.stop_tokens_for_assistant_actions())
-print(f"[gpt-server] ready. harmony stop tokens: {sorted(STOP_IDS)}")
+
+
+def _load():
+    print(f"[gpt-server] loading model from {MODEL_PATH} ...")
+    m, _ = load(MODEL_PATH)                           # tokenizer unused: harmony owns it
+    return m
+
+
+model = GPU.submit(_load).result()                    # load on the worker thread too
+print(f"[gpt-server] ready on MLX worker thread. harmony stop tokens: {sorted(STOP_IDS)}")
 
 _EFFORT = {
     "low": ReasoningEffort.LOW,
@@ -247,7 +266,8 @@ async def chat_completions(request: Request):
     cid = "chatcmpl-" + uuid.uuid4().hex
 
     if not stream:
-        tokens = list(run_tokens(body))
+        # Generate entirely on the MLX worker thread; await without blocking loop.
+        tokens = await asyncio.wrap_future(GPU.submit(lambda: list(run_tokens(body))))
         reasoning, content, tool_calls = parse_final(tokens)
         message: Dict[str, Any] = {"role": "assistant",
                                    "content": content if content else None}
@@ -262,13 +282,26 @@ async def chat_completions(request: Request):
             "choices": [{"index": 0, "message": message, "finish_reason": finish}],
         })
 
-    # Streaming: emit reasoning_content + content deltas live; tool calls are
-    # consolidated into one delta at the end (Copilot accepts this), with the
-    # correct finish_reason so the agent loop triggers.
+    # Streaming: a producer runs generation on the MLX worker thread and pushes
+    # token ids into a queue. The SSE generator (which Starlette may iterate on
+    # any threadpool thread) only drains the queue and runs harmony parsing,
+    # which is CPU-only and thread-safe. No Metal op ever leaves the worker.
     def sse():
         parser = StreamableParser(enc, role=Role.ASSISTANT)
         tool_calls: List[Dict[str, Any]] = []
         cur_tool: Optional[Dict[str, Any]] = None
+        q: "queue.Queue" = queue.Queue(maxsize=256)
+
+        def produce():
+            try:
+                for token in run_tokens(body):       # all MLX work, worker thread
+                    q.put(("tok", token))
+            except Exception as e:                   # surface crashes to the client
+                q.put(("err", repr(e)))
+            finally:
+                q.put(("end", None))
+
+        GPU.submit(produce)
 
         def chunk(delta: Dict[str, Any], finish: Optional[str] = None) -> str:
             return "data: " + json.dumps({
@@ -279,8 +312,17 @@ async def chat_completions(request: Request):
 
         yield chunk({"role": "assistant"})
 
-        for token in run_tokens(body):
-            parser.process(token)
+        errored = False
+        while True:
+            kind, val = q.get()
+            if kind == "end":
+                break
+            if kind == "err":
+                print(f"[gpt-server] generation error: {val}")
+                errored = True
+                break
+            token = val
+            parser.process(token)                    # harmony parse: CPU, safe here
             delta = parser.last_content_delta
             if not delta:
                 continue
@@ -300,7 +342,9 @@ async def chat_completions(request: Request):
             else:                                    # "final" (or stray) -> content
                 yield chunk({"content": delta})
 
-        if tool_calls:
+        if errored:
+            yield chunk({}, finish="stop")
+        elif tool_calls:
             tc_delta = [{"index": i, **tc} for i, tc in enumerate(tool_calls)]
             yield chunk({"tool_calls": tc_delta}, finish="tool_calls")
         else:
