@@ -5,44 +5,62 @@ Apple Silicon via llama-cpp-python, built so GitHub Copilot's Custom Endpoint
 treats it like a native model: tool calling, agent/plan mode, clean formatting
 (reasoning never leaks into the answer).
 
-WHY THIS FILE EXISTS (vs the MLX one)
-  MLX cannot read a GGUF k-quant (Q4_K_M). The only way to use the .gguf you
-  already have, from Python, is llama-cpp-python — which IS llama.cpp compiled
-  into a pip-installable extension. There is no separate llama-server binary and
-  nothing to build from source (prebuilt Metal wheels exist for Apple Silicon),
-  but it is llama.cpp under the hood. If that's acceptable, this is your path; if
-  the llama.cpp codebase itself is off-limits, download MLX weights and use
-  qwen-server.py instead.
+WHAT CHANGED vs the first draft (and WHY agent mode was failing)
+  Qwen3.6-35B-A3B was trained on the Qwen3-CODER tool-call format, which is
+  nested XML, NOT Hermes JSON:
 
-  Design: we render the prompt with Qwen's official chat template (via the HF
-  tokenizer — a small download, NOT the weights), run raw text generation through
-  the GGUF, and split the output stream into reasoning_content / content /
-  tool_calls with the same parser used by the MLX version.
+      <tool_call>
+      <function=read_file>
+      <parameter=path>
+      src/main.py
+      </parameter>
+      </function>
+      </tool_call>
+
+  The old parser ran json.loads() on that, threw, swallowed the error, and
+  emitted a tool call with name="" + raw XML as arguments. Copilot discards
+  empty-name tool calls, so the model would narrate its plan ("I'll explore the
+  codebase...") and then stop with no tool execution. The parser below reads the
+  real XML format (with a JSON fallback in case a turn emits Hermes style),
+  does schema-aware type coercion of parameter values, and never emits a
+  nameless tool call.
+
+  Also fixed / added:
+   - finish_reason="tool_calls" is now sent in its OWN terminal chunk (some
+     strict clients choke on a delta + finish_reason in the same SSE chunk).
+   - Unclosed tool calls (cut off by max_tokens / EOS) are still finalized
+     instead of being silently dropped.
+   - presence_penalty default (Qwen3.6's recommended anti-loop knob).
+   - Optional KV-cache quantization, larger prefill batch, and optional
+     prompt-lookup speculative decoding (big win for coding/agent echo).
+   - preserve_thinking chat_template_kwarg on by default (helps agent turns).
+
+WHY THIS FILE (vs the MLX one): MLX can't read a GGUF k-quant, so to use the
+.gguf you already have from Python you need llama-cpp-python (prebuilt Metal
+wheels exist for Apple Silicon; it's llama.cpp under the hood).
 
 RUN
   python3 -m venv ~/llama-env && source ~/llama-env/bin/activate
-  # Metal wheel for Apple Silicon (prebuilt; no compiler needed in most setups):
   pip install -U llama-cpp-python transformers fastapi "uvicorn[standard]"
-  export QWEN_GGUF="$HOME/models/Qwen3.6-35B-A3B-Q4_K_M.gguf"   # your .gguf file
-  export QWEN_TOKENIZER="Qwen/Qwen3.6-35B-A3B"                  # tokenizer/template only
-  python qwen-server-gguf.py                                    # http://localhost:8000
-
-  (If pip pulls a CPU-only wheel, force a Metal build:
+  export QWEN_GGUF="$HOME/models/Qwen3.6-35B-A3B-Q4_K_M.gguf"
+  export QWEN_TOKENIZER="Qwen/Qwen3.6-35B-A3B"   # tokenizer/template only
+  python qwen-server-gguf.py                     # http://127.0.0.1:8000
+  (CPU-only wheel? force Metal:
      CMAKE_ARGS="-DGGML_METAL=on" pip install -U --no-binary llama-cpp-python llama-cpp-python)
 
-VS CODE (chatLanguageModels.json) — point the model's `url` at:
-  http://localhost:8000/v1/chat/completions
-  set "id" to QWEN_ID, "toolCalling": true, "thinking": true
+VS CODE (chatLanguageModels.json): point `url` at
+  http://localhost:8000/v1/chat/completions , set "toolCalling": true, "thinking": true
 """
 
 import os
+import re
 import json
 import time
 import uuid
 import asyncio
 import queue
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from llama_cpp import Llama
 from transformers import AutoTokenizer
@@ -58,28 +76,59 @@ GGUF_PATH = os.environ.get("QWEN_GGUF", os.path.expanduser("~/models/Qwen3.6-35B
 TOKENIZER = os.environ.get("QWEN_TOKENIZER", "Qwen/Qwen3.6-35B-A3B")
 MODEL_ID = os.environ.get("QWEN_ID", "qwen3.6-35b-a3b")
 PORT = int(os.environ.get("QWEN_PORT", "8000"))
-N_CTX = int(os.environ.get("QWEN_CTX", "32768"))
-N_GPU_LAYERS = int(os.environ.get("QWEN_NGL", "-1"))      # -1 = offload all to Metal
+N_CTX = int(os.environ.get("QWEN_CTX", "65536"))         # model is 262K-native; raise if RAM allows
+N_GPU_LAYERS = int(os.environ.get("QWEN_NGL", "-1"))     # -1 = offload all to Metal
+N_BATCH = int(os.environ.get("QWEN_N_BATCH", "1024"))    # bigger prefill batch = faster on long agent prompts
+N_THREADS = os.environ.get("QWEN_N_THREADS")             # set to P-core count (M4 Max: ~12); None = auto
 DEFAULT_MAX_TOKENS = int(os.environ.get("QWEN_MAX_TOKENS", "4096"))
 
-# Qwen3.6 thinking-mode sampling recipe (greedy/low-temp can loop; these match
-# Qwen's recommended thinking defaults). Clients may override per request.
-DEF_TEMP = float(os.environ.get("QWEN_TEMP", "0.6"))
-DEF_TOP_P = float(os.environ.get("QWEN_TOP_P", "0.95"))
+# KV-cache quantization (more context headroom). 0=f16 (default), 8=q8_0, 2=q4_0.
+# q8_0 nearly free quality-wise and roughly halves KV memory; requires flash_attn.
+KV_TYPE_K = int(os.environ.get("QWEN_KV_TYPE_K", "0"))
+KV_TYPE_V = int(os.environ.get("QWEN_KV_TYPE_V", "0"))
+
+# Optional prompt-lookup speculative decoding. Coding/agent output echoes the
+# input (file contents, identifiers) heavily, so this can be a real speedup.
+USE_PROMPT_LOOKUP = os.environ.get("QWEN_PROMPT_LOOKUP", "0") == "1"
+PROMPT_LOOKUP_TOKENS = int(os.environ.get("QWEN_PROMPT_LOOKUP_TOKENS", "10"))
+
+# Qwen3.6 thinking-mode sampling. Coding-leaning defaults; presence_penalty is
+# the recommended anti-loop knob (Qwen3.6 suggests up to ~1.5 in thinking mode).
+DEF_TEMP = float(os.environ.get("QWEN_TEMP", "0.7"))
+DEF_TOP_P = float(os.environ.get("QWEN_TOP_P", "0.8"))
 DEF_TOP_K = int(os.environ.get("QWEN_TOP_K", "20"))
 DEF_MIN_P = float(os.environ.get("QWEN_MIN_P", "0.0"))
-DEF_REPEAT = float(os.environ.get("QWEN_REPEAT_PENALTY", "1.0"))   # 1.0 = off
+DEF_REPEAT = float(os.environ.get("QWEN_REPEAT_PENALTY", "1.05"))
+DEF_PRESENCE = float(os.environ.get("QWEN_PRESENCE_PENALTY", "1.5"))
+DEF_FREQUENCY = float(os.environ.get("QWEN_FREQUENCY_PENALTY", "0.0"))
 
 # llama-cpp-python's Llama object is not safe for concurrent calls, and a stream
 # generator must be drained on the thread that created it. Pin all model work to
-# one worker; this also serializes overlapping requests.
+# one worker; this also serializes overlapping requests AND lets llama.cpp reuse
+# the shared KV prefix across agent turns (free prefix caching).
 GPU = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llama")
 
 
 def _load():
     print(f"[qwen-server] loading GGUF {GGUF_PATH} (n_ctx={N_CTX}, ngl={N_GPU_LAYERS}) ...")
-    return Llama(model_path=GGUF_PATH, n_ctx=N_CTX, n_gpu_layers=N_GPU_LAYERS,
-                 flash_attn=True, verbose=False)
+    kw: Dict[str, Any] = dict(
+        model_path=GGUF_PATH, n_ctx=N_CTX, n_gpu_layers=N_GPU_LAYERS,
+        n_batch=N_BATCH, flash_attn=True, verbose=False,
+    )
+    if N_THREADS:
+        kw["n_threads"] = int(N_THREADS)
+    if KV_TYPE_K:
+        kw["type_k"] = KV_TYPE_K
+    if KV_TYPE_V:
+        kw["type_v"] = KV_TYPE_V
+    if USE_PROMPT_LOOKUP:
+        try:
+            from llama_cpp.llama_speculative import LlamaPromptLookupDecoding
+            kw["draft_model"] = LlamaPromptLookupDecoding(num_pred_tokens=PROMPT_LOOKUP_TOKENS)
+            print(f"[qwen-server] prompt-lookup decoding on (n={PROMPT_LOOKUP_TOKENS})")
+        except Exception as e:
+            print(f"[qwen-server] prompt-lookup unavailable, continuing without: {e!r}")
+    return Llama(**kw)
 
 
 llm = GPU.submit(_load).result()
@@ -107,8 +156,11 @@ def _text_of(content: Any) -> str:
 
 
 def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Flatten list-style content, and convert OpenAI tool_call JSON-string
-    arguments into dicts (Qwen's template iterates the object)."""
+    """Flatten list-style content; convert OpenAI tool_call JSON-string arguments
+    into dicts (the Qwen template iterates the object, and passing a string trips
+    the well-known 'Can only get item pairs from a mapping' template crash).
+    Preserve reasoning_content on assistant turns so preserve_thinking has
+    something to keep if the client replays it (harmless otherwise)."""
     out: List[Dict[str, Any]] = []
     for m in messages:
         role = m.get("role")
@@ -126,6 +178,12 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 tcs.append({**tc, "function": fn})
             msg["tool_calls"] = tcs
             msg["content"] = _text_of(m.get("content"))
+            if m.get("reasoning_content"):
+                msg["reasoning_content"] = m["reasoning_content"]
+        elif role == "assistant":
+            msg["content"] = _text_of(m.get("content"))
+            if m.get("reasoning_content"):
+                msg["reasoning_content"] = m["reasoning_content"]
         elif role == "tool":
             msg["content"] = _text_of(m.get("content"))
             if m.get("name"):
@@ -145,23 +203,34 @@ def build_prompt(body: Dict[str, Any]) -> str:
     enable_thinking = body.get("enable_thinking")
     if enable_thinking is None:
         enable_thinking = str(body.get("reasoning_effort", "")).lower() != "none"
-    extra = dict(body.get("chat_template_kwargs") or {})
+
+    # preserve_thinking helps Qwen3.6 in multi-turn agent loops; let the client
+    # override via chat_template_kwargs.
+    extra = {"preserve_thinking": True}
+    extra.update(dict(body.get("chat_template_kwargs") or {}))
 
     def render(**kw) -> str:
         return tok.apply_chat_template(
             messages, tools=tools, add_generation_prompt=True, tokenize=False, **kw
         )
 
-    try:
-        return render(enable_thinking=enable_thinking, **extra)
-    except TypeError:
-        return render(**extra)
+    # Degrade gracefully if a given template doesn't accept a kwarg.
+    for attempt in (
+        dict(enable_thinking=enable_thinking, **extra),
+        dict(enable_thinking=enable_thinking),
+        dict(**extra),
+        dict(),
+    ):
+        try:
+            return render(**attempt)
+        except TypeError:
+            continue
+    return render()
 
 
 def _starts_in_think(prompt: str) -> bool:
     """True if the template already opened a <think> block at the end of the
-    prompt (some Qwen templates do this in thinking mode), so generation starts
-    mid-reasoning with no opening tag in the model's output."""
+    prompt, so generation starts mid-reasoning with no opening tag emitted."""
     last_open = prompt.rfind("<think>")
     if last_open == -1:
         return False
@@ -169,21 +238,105 @@ def _starts_in_think(prompt: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Qwen3-Coder XML tool-call parsing
+# --------------------------------------------------------------------------- #
+_FUNC_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)(?:</function>|$)", re.DOTALL)
+_PARAM_RE = re.compile(
+    r"<parameter=([^>\s]+)\s*>(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
+    re.DOTALL,
+)
+
+
+def _strip_wrap_newlines(v: str) -> str:
+    if v.startswith("\n"):
+        v = v[1:]
+    if v.endswith("\n"):
+        v = v[:-1]
+    return v
+
+
+def _coerce(val: str, schema: Optional[Dict[str, Any]]) -> Any:
+    """Coerce a raw XML parameter string into the type the tool schema expects.
+    The model emits everything as text; Copilot validates against the schema, so
+    a string '3' for an integer param (or 'true' for a bool) must be converted."""
+    t = (schema or {}).get("type")
+    s = val.strip()
+    try:
+        if t == "integer":
+            return int(s)
+        if t == "number":
+            return float(s)
+        if t == "boolean":
+            return s.lower() == "true"
+        if t in ("object", "array"):
+            return json.loads(s)
+        if t == "string":
+            return _strip_wrap_newlines(val)
+        # Unknown/absent schema: best-effort JSON, else keep as text.
+        return json.loads(s)
+    except Exception:
+        return _strip_wrap_newlines(val)
+
+
+def _props_for(func_name: str, tools: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    if not tools:
+        return {}
+    for tdef in tools:
+        fn = tdef.get("function", tdef)
+        if fn.get("name") == func_name:
+            return (fn.get("parameters") or {}).get("properties", {}) or {}
+    return {}
+
+
+def parse_tool_block(raw: str, tools: Optional[List[Dict[str, Any]]]) -> Tuple[str, Dict[str, Any]]:
+    """Parse the inside of a <tool_call>...</tool_call> block.
+    Tries Qwen3-Coder XML first, falls back to Hermes JSON."""
+    raw = raw.strip()
+
+    fm = _FUNC_RE.search(raw)
+    if fm:
+        name = fm.group(1).strip()
+        body = fm.group(2)
+        props = _props_for(name, tools)
+        args: Dict[str, Any] = {}
+        for pm in _PARAM_RE.finditer(body):
+            key = pm.group(1).strip()
+            args[key] = _coerce(pm.group(2), props.get(key))
+        return name, args
+
+    # Fallback: Hermes JSON ({"name": ..., "arguments": {...}})
+    try:
+        obj = json.loads(raw)
+        name = obj.get("name", "")
+        a = obj.get("arguments", obj.get("parameters", {}))
+        if isinstance(a, str):
+            try:
+                a = json.loads(a)
+            except Exception:
+                a = {}
+        return name, (a if isinstance(a, dict) else {})
+    except Exception:
+        return "", {}
+
+
+# --------------------------------------------------------------------------- #
 # Streaming parser: Qwen text stream -> reasoning / content / tool_calls
 # --------------------------------------------------------------------------- #
 class QwenStreamParser:
     """Qwen emits optional <think>...</think> first, then content that may
-    contain <tool_call>\n{json}\n</tool_call> blocks. feed(delta) returns
-    ("reasoning"|"content", str) events to stream now; finish() flushes tool calls."""
+    contain <tool_call>...</tool_call> blocks (Coder XML inside). feed(delta)
+    returns ("reasoning"|"content", str) events to stream now; finish() flushes
+    tool calls."""
 
     _MARKERS = ("<think>", "</think>", "<tool_call>", "</tool_call>")
     _HOLD = max(len(m) for m in _MARKERS) - 1
 
-    def __init__(self, initial_mode: str = "content"):
+    def __init__(self, initial_mode: str = "content", tools: Optional[List[Dict[str, Any]]] = None):
         self.buf = ""
         self.mode = initial_mode          # "content" | "reasoning"
         self.in_tool = False
         self._tool_buf = ""
+        self.tools = tools
         self.tool_calls: List[Dict[str, Any]] = []
 
     def _emit(self, text, events):
@@ -200,6 +353,9 @@ class QwenStreamParser:
                     cut = len(self.buf) if final else max(0, len(self.buf) - self._HOLD)
                     self._tool_buf += self.buf[:cut]
                     self.buf = self.buf[cut:]
+                    if final:                 # cut off mid-call: finalize anyway
+                        self._finalize_tool()
+                        self.in_tool = False
                     break
                 self._tool_buf += self.buf[:idx]
                 self.buf = self.buf[idx + len("</tool_call>"):]
@@ -231,20 +387,16 @@ class QwenStreamParser:
         return events
 
     def _finalize_tool(self):
-        raw = self._tool_buf.strip()
+        raw = self._tool_buf
         self._tool_buf = ""
-        name, args = "", raw
-        try:
-            obj = json.loads(raw)
-            name = obj.get("name", "")
-            a = obj.get("arguments", obj.get("parameters", {}))
-            args = a if isinstance(a, str) else json.dumps(a)
-        except Exception:
-            pass
+        name, args = parse_tool_block(raw, self.tools)
+        if not name:                          # never emit a nameless tool call
+            print(f"[qwen-server] dropping unparseable tool block: {raw[:200]!r}")
+            return
         self.tool_calls.append({
             "id": "call_" + uuid.uuid4().hex[:24],
             "type": "function",
-            "function": {"name": name, "arguments": args or "{}"},
+            "function": {"name": name, "arguments": json.dumps(args)},
         })
 
     def finish(self):
@@ -256,22 +408,24 @@ class QwenStreamParser:
 # --------------------------------------------------------------------------- #
 def run_text(prompt: str, body: Dict[str, Any]):
     """Yield generated text deltas (worker thread only)."""
-    temp = body.get("temperature")
-    temp = DEF_TEMP if temp is None else float(temp)
-    top_p = body.get("top_p")
-    top_p = DEF_TOP_P if top_p is None else float(top_p)
-    top_k = body.get("top_k")
-    top_k = DEF_TOP_K if top_k is None else int(top_k)
-    min_p = body.get("min_p")
-    min_p = DEF_MIN_P if min_p is None else float(min_p)
-    repeat = body.get("repetition_penalty")
-    repeat = DEF_REPEAT if repeat is None else float(repeat)
+    def pick(key, default, cast):
+        v = body.get(key)
+        return default if v is None else cast(v)
+
+    temp = pick("temperature", DEF_TEMP, float)
+    top_p = pick("top_p", DEF_TOP_P, float)
+    top_k = pick("top_k", DEF_TOP_K, int)
+    min_p = pick("min_p", DEF_MIN_P, float)
+    repeat = pick("repetition_penalty", DEF_REPEAT, float)
+    presence = pick("presence_penalty", DEF_PRESENCE, float)
+    frequency = pick("frequency_penalty", DEF_FREQUENCY, float)
     max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens")
                      or DEFAULT_MAX_TOKENS)
 
     for out in llm.create_completion(
         prompt, max_tokens=max_tokens, temperature=temp, top_p=top_p,
         top_k=top_k, min_p=min_p, repeat_penalty=repeat,
+        presence_penalty=presence, frequency_penalty=frequency,
         stop=["<|im_end|>"], stream=True,
     ):
         piece = out["choices"][0].get("text", "")
@@ -292,6 +446,7 @@ def list_models():
 async def chat_completions(request: Request):
     body = await request.json()
     stream = bool(body.get("stream", False))
+    tools = body.get("tools") or None
     created = int(time.time())
     cid = "chatcmpl-" + uuid.uuid4().hex
 
@@ -300,7 +455,7 @@ async def chat_completions(request: Request):
 
     if not stream:
         def generate_all():
-            parser = QwenStreamParser(initial_mode=init_mode)
+            parser = QwenStreamParser(initial_mode=init_mode, tools=tools)
             reasoning, content = "", ""
             for delta in run_text(prompt, body):
                 for kind, txt in parser.feed(delta):
@@ -334,7 +489,7 @@ async def chat_completions(request: Request):
     # deltas to a queue; the SSE generator only drains the queue and parses
     # (pure Python, thread-safe). No llama.cpp call leaves the worker.
     def sse():
-        parser = QwenStreamParser(initial_mode=init_mode)
+        parser = QwenStreamParser(initial_mode=init_mode, tools=tools)
         q: "queue.Queue" = queue.Queue(maxsize=256)
 
         def produce():
@@ -379,7 +534,8 @@ async def chat_completions(request: Request):
             yield chunk({}, finish="stop")
         elif tool_calls:
             tc_delta = [{"index": i, **tc} for i, tc in enumerate(tool_calls)]
-            yield chunk({"tool_calls": tc_delta}, finish="tool_calls")
+            yield chunk({"tool_calls": tc_delta})       # tool calls (finish_reason null)
+            yield chunk({}, finish="tool_calls")        # separate terminal chunk
         else:
             yield chunk({}, finish="stop")
         yield "data: [DONE]\n\n"
