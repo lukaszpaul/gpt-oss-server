@@ -86,13 +86,26 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("QWEN_MAX_TOKENS", "4096"))
 # server's n_ubatch; try 4096 on M4 Max (cheap A/B, watch the prefill t/s log).
 PREFILL_STEP = int(os.environ.get("QWEN_PREFILL_STEP", "2048"))
 
-# Prompt-cache slots. 2 = agent loop + one side request without mutual
-# eviction. Each slot holds fp16 KV for its full prompt (~a few GB at 30k
-# tokens), so raise this only if memory allows.
-CACHE_SLOTS = int(os.environ.get("QWEN_CACHE_SLOTS", "2"))
+# Prompt-cache slots. 3 = agent loop + two side-request streams (Copilot can
+# fire title gen AND summaries between agent turns) without mutual eviction.
+# Each slot holds fp16 KV for its full prompt (~a few GB at 30k tokens).
+CACHE_SLOTS = int(os.environ.get("QWEN_CACHE_SLOTS", "3"))
 # A request "matches" a slot only if it shares at least this many prefix
 # tokens; otherwise it's treated as a new conversation (fresh/LRU slot).
+# NOTE: kv-reuse=0 in the log can therefore mean "matched < MIN_PREFIX",
+# not literally zero — the divergence log (below) shows the true number.
 MIN_PREFIX = int(os.environ.get("QWEN_MIN_PREFIX", "1024"))
+
+# Cache diagnostics: when a request diverges from its best-matching slot,
+# print WHERE it diverged and the differing text on both sides. This is the
+# tool for hunting prompt churn (timestamps, shuffled tools, editor state).
+CACHE_DEBUG = os.environ.get("QWEN_CACHE_DEBUG", "1") == "1"
+
+# Copilot is not guaranteed to send the tools array in a stable order, and
+# tools render near the TOP of the Qwen prompt — a shuffled tool list breaks
+# ALL prefix reuse by itself. Sorting by function name makes the rendered
+# prompt deterministic; the model just sees a consistent ordering.
+SORT_TOOLS = os.environ.get("QWEN_SORT_TOOLS", "1") == "1"
 
 # Optional: ask MLX to wire its GPU buffers (resists page eviction between
 # turns). Set to e.g. 56 (GB). Requires the sysctl above to be raised first.
@@ -181,6 +194,25 @@ def _common_prefix(a: List[int], b: List[int]) -> int:
     return i
 
 
+def _log_divergence(slot: "_Slot", tokens: List[int], k: int):
+    """Print where the new prompt stops matching the best slot, with the text
+    on both sides of the split. One glance identifies the churn source:
+    a timestamp, shuffled tool defs, editor state, etc."""
+    if k >= min(len(tokens), len(slot.tokens)):
+        return  # clean extension, nothing diverged
+    try:
+        lo = max(0, k - 15)
+        cached = tok.decode(slot.tokens[lo:k + 40])
+        new = tok.decode(tokens[lo:k + 40])
+        pct = (100 * k // len(tokens)) if tokens else 0
+        print(f"[qwen-server] slot={slot.idx} best match {k}t/{len(tokens)}t "
+              f"({pct}%) — diverges at token {k}:\n"
+              f"  cached: {cached!r}\n"
+              f"  new:    {new!r}")
+    except Exception:
+        pass
+
+
 def _acquire_slot(tokens: List[int]) -> Tuple[_Slot, int]:
     """Pick the slot with the longest common prefix; spawn or LRU-recycle a
     slot if nothing matches meaningfully. Returns (slot, usable_prefix_len).
@@ -190,13 +222,20 @@ def _acquire_slot(tokens: List[int]) -> Tuple[_Slot, int]:
         k = _common_prefix(s.tokens, tokens)
         if k > best_k:
             best, best_k = s, k
+    if CACHE_DEBUG and best is not None and best.tokens:
+        _log_divergence(best, tokens, best_k)
     if best is not None and best_k >= MIN_PREFIX:
         return best, best_k
     if len(_SLOTS) < CACHE_SLOTS:
         s = _Slot(len(_SLOTS))
         _SLOTS.append(s)
         return s, 0
-    s = min(_SLOTS, key=lambda x: x.last_used)   # LRU recycle
+    # All slots busy and nothing matched well: recycle the LRU slot, but keep
+    # whatever prefix it DOES share with this prompt instead of starting cold.
+    s = min(_SLOTS, key=lambda x: x.last_used)
+    k = _common_prefix(s.tokens, tokens)
+    if k > 0:
+        return s, k
     s.reset()
     return s, 0
 
@@ -230,9 +269,15 @@ def _sync_slot(slot: _Slot, prompt_tokens: List[int], gen_ids: List[int]):
         full = prompt_tokens + gen_ids
         if 0 <= n_cached <= len(full):
             slot.tokens = full[:n_cached]
+            if CACHE_DEBUG:
+                print(f"[qwen-server] slot={slot.idx} cache holds {n_cached}t")
         else:
+            print(f"[qwen-server] WARNING slot={slot.idx}: cache offset "
+                  f"{n_cached} > tracked {len(full)} — resetting, reuse lost")
             slot.reset()
-    except Exception:
+    except Exception as e:
+        print(f"[qwen-server] WARNING slot={slot.idx}: ledger sync failed "
+              f"({e!r}) — resetting, reuse lost")
         slot.reset()
     slot.last_used = time.time()
 
@@ -297,6 +342,14 @@ def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def build_prompt(body: Dict[str, Any]) -> str:
     messages = _normalize_messages(body.get("messages", []))
     tools = body.get("tools") or None
+    if tools and SORT_TOOLS:
+        try:
+            tools = sorted(
+                tools,
+                key=lambda t: (t.get("function", t) or {}).get("name") or "",
+            )
+        except Exception:
+            pass
 
     enable_thinking = body.get("enable_thinking")
     if enable_thinking is None:
