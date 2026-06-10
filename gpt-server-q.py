@@ -1,84 +1,54 @@
 #!/usr/bin/env python3
 """
-qwen-server-gguf.py — OpenAI-compatible server for Qwen3.6-35B-A3B (GGUF) on
-Apple Silicon via llama-cpp-python, built so GitHub Copilot's Custom Endpoint
-treats it like a native model: tool calling, agent/plan mode, clean formatting
-(reasoning never leaks into the answer).
+qwen-server-mlx.py — OpenAI-compatible server for Qwen3.6-35B-A3B (MLX 4-bit)
+on Apple Silicon, drop-in replacement for qwen-server-gguf.py as a GitHub
+Copilot Custom Endpoint (same URL, same tool calling, same <think> handling).
 
-PERF NOTES (patched — tuned for Copilot's ~30k-token agent prompts)
-  The dominant cost is PREFILL of the huge Copilot prompt, not decode. Three
-  levers, in order of impact:
+WHY MLX (vs the llama-cpp-python version)
+  The GGUF server's prefix reuse was implicit (one hidden slot inside
+  llama-cpp-python) and was observed re-prefilling the full ~30k Copilot
+  prompt every turn despite >95% token-level prefix match. Here the prompt
+  cache is EXPLICIT and owned by this script:
 
-  1. KV-prefix reuse (free, already structural). Everything runs on ONE Llama
-     instance on ONE worker thread, so llama.cpp automatically diffs each new
-     prompt against the tokens already in the KV cache and only prefills the
-     new tail. Agent loops replay the same prefix + new turns, so after the
-     first (slow) request, each turn should prefill only the delta.
-     -> run_text() now LOGS "kv-reuse" per request. If you see reuse ~0% on
-        agent turns, Copilot is injecting changing content (timestamps, open
-        editor context) near the TOP of the prompt and killing the cache —
-        that's the thing to hunt, not sampling knobs.
+  1. SLOT CACHE. QWEN_CACHE_SLOTS (default 2) independent prompt caches.
+     Each request is routed to the slot with the longest common token prefix,
+     so a Copilot side request (title gen, summarization) lands in its own
+     slot instead of evicting the agent loop's 30k-token prefix.
 
-  2. Prefill throughput: n_batch AND n_ubatch raised to 2048 (n_ubatch is the
-     one that actually gates Metal prefill chunking; llama-cpp-python defaults
-     it to 512 regardless of n_batch). KV cache defaults to q8_0 now
-     (flash_attn is on, which q8 KV requires) — ~half the KV memory at 64k ctx,
-     near-lossless, less memory pressure on a 64GB box.
+  2. EXACT TRIM + DELTA PREFILL. The chosen slot's cache is trimmed to the
+     common prefix (mlx_lm trim_prompt_cache), then ONLY the new suffix is
+     prefilled. After every request the slot's token ledger is synced from
+     the cache's actual offset — ground truth, not bookkeeping hope — so a
+     crash or partial generation can never silently corrupt reuse.
 
-  3. Decode: QWEN_THINKING=0 disables <think> globally for max agent speed
-     (plan-mode quality tradeoff; per-request reasoning_effort still wins).
-     Prompt-lookup speculative decoding (QWEN_PROMPT_LOOKUP=1) is OFF by
-     default: llama-cpp-python's draft-model path needs logits_all=True,
-     which is memory-prohibitive at long context — see the config comment.
+  3. VISIBILITY. Every request logs: slot id, prompt tokens, reused tokens,
+     suffix actually prefilled, TTFT, prefill t/s (from MLX itself), and
+     decode t/s. If reuse ever drops, you'll see exactly when and how much.
 
-  Optional: QWEN_RAM_CACHE=1 enables LlamaRAMCache so two *interleaved*
-  conversations (e.g. Copilot firing a side request mid-agent-loop) don't
-  evict each other's prefix. Off by default: it snapshots full KV state per
-  entry, which is GB-scale at long context — watch memory if you turn it on.
+  KV cache is fp16 (Qwen3 MoE KV is small; ~30k tokens is a few GB per slot,
+  fine on 64GB next to ~18GB of 4-bit weights). Sampling matches the GGUF
+  server, including an additive OpenAI-style presence penalty implemented as
+  a custom logits processor (mlx_lm only ships repetition_penalty natively;
+  presence is Qwen3.6's recommended anti-loop knob, so it's reimplemented).
 
-WHAT CHANGED vs the first draft (and WHY agent mode was failing)
-  Qwen3.6-35B-A3B was trained on the Qwen3-CODER tool-call format, which is
-  nested XML, NOT Hermes JSON:
-
-      <tool_call>
-      <function=read_file>
-      <parameter=path>
-      src/main.py
-      </parameter>
-      </function>
-      </tool_call>
-
-  The old parser ran json.loads() on that, threw, swallowed the error, and
-  emitted a tool call with name="" + raw XML as arguments. Copilot discards
-  empty-name tool calls, so the model would narrate its plan ("I'll explore the
-  codebase...") and then stop with no tool execution. The parser below reads the
-  real XML format (with a JSON fallback in case a turn emits Hermes style),
-  does schema-aware type coercion of parameter values, and never emits a
-  nameless tool call.
-
-  Also fixed / added:
-   - finish_reason="tool_calls" is now sent in its OWN terminal chunk (some
-     strict clients choke on a delta + finish_reason in the same SSE chunk).
-   - Unclosed tool calls (cut off by max_tokens / EOS) are still finalized
-     instead of being silently dropped.
-   - presence_penalty default (Qwen3.6's recommended anti-loop knob).
-   - preserve_thinking chat_template_kwarg on by default (helps agent turns).
-
-WHY THIS FILE (vs the MLX one): MLX can't read a GGUF k-quant, so to use the
-.gguf you already have from Python you need llama-cpp-python (prebuilt Metal
-wheels exist for Apple Silicon; it's llama.cpp under the hood).
+THREADING
+  Same pattern as the gpt-oss MLX server: ALL Metal work pinned to one
+  worker thread (ThreadPoolExecutor(max_workers=1)); SSE generators only
+  drain a queue. MLX is not safe for concurrent graph eval from multiple
+  threads — this is the fix for the Metal threading crash seen before.
 
 RUN
-  python3 -m venv ~/llama-env && source ~/llama-env/bin/activate
-  pip install -U llama-cpp-python transformers fastapi "uvicorn[standard]"
-  export QWEN_GGUF="$HOME/models/Qwen3.6-35B-A3B-Q4_K_M.gguf"
-  export QWEN_TOKENIZER="Qwen/Qwen3.6-35B-A3B"   # tokenizer/template only
-  python qwen-server-gguf.py                     # http://127.0.0.1:8000
-  (CPU-only wheel? force Metal:
-     CMAKE_ARGS="-DGGML_METAL=on" pip install -U --no-binary llama-cpp-python llama-cpp-python)
+  python3 -m venv ~/mlx-env && source ~/mlx-env/bin/activate
+  pip install -U mlx-lm fastapi "uvicorn[standard]"
+  export QWEN_MLX="mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit"   # or a local dir
+  python qwen-server-mlx.py                                    # http://127.0.0.1:8000
 
-VS CODE (chatLanguageModels.json): point `url` at
-  http://localhost:8000/v1/chat/completions , set "toolCalling": true, "thinking": true
+  Still worth keeping at the OS level (weight-eviction insurance):
+    sudo sysctl iogpu.wired_limit_mb=57344
+  Optionally also QWEN_WIRED_GB=56 to ask MLX to wire its buffers.
+
+VS CODE (chatLanguageModels.json): unchanged — point `url` at
+  http://localhost:8000/v1/chat/completions , "toolCalling": true, "thinking": true
 """
 
 import os
@@ -91,129 +61,180 @@ import queue
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-from llama_cpp import Llama
-from transformers import AutoTokenizer
+import mlx.core as mx
+from mlx_lm import load, stream_generate
+from mlx_lm.sample_utils import make_sampler, make_logits_processors
+from mlx_lm.models.cache import (
+    make_prompt_cache,
+    trim_prompt_cache,
+    can_trim_prompt_cache,
+)
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 
 # --------------------------------------------------------------------------- #
-# Setup
+# Config
 # --------------------------------------------------------------------------- #
-GGUF_PATH = os.environ.get("QWEN_GGUF", os.path.expanduser("~/models/Qwen3.6-35B-A3B-Q4_K_M.gguf"))
-TOKENIZER = os.environ.get("QWEN_TOKENIZER", "Qwen/Qwen3.6-35B-A3B")
+MODEL_PATH = os.environ.get("QWEN_MLX", "mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit")
 MODEL_ID = os.environ.get("QWEN_ID", "qwen3.6-35b-a3b")
 PORT = int(os.environ.get("QWEN_PORT", "8000"))
-N_CTX = int(os.environ.get("QWEN_CTX", "65536"))         # model is 262K-native; raise if RAM allows
-N_GPU_LAYERS = int(os.environ.get("QWEN_NGL", "-1"))     # -1 = offload all to Metal
-
-# Prefill batching. n_ubatch is the micro-batch llama.cpp actually pushes
-# through Metal per step; llama-cpp-python defaults it to 512 even when
-# n_batch is larger, so set BOTH. 2048 is a good M4 Max starting point.
-N_BATCH = int(os.environ.get("QWEN_N_BATCH", "2048"))
-N_UBATCH = int(os.environ.get("QWEN_N_UBATCH", str(N_BATCH)))
-N_THREADS = os.environ.get("QWEN_N_THREADS")             # set to P-core count (M4 Max: ~12); None = auto
-N_THREADS_BATCH = os.environ.get("QWEN_N_THREADS_BATCH") # batch/prompt CPU-side helpers; try same as P-core count
 DEFAULT_MAX_TOKENS = int(os.environ.get("QWEN_MAX_TOKENS", "4096"))
 
-# KV-cache quantization. 0=f16, 8=q8_0, 2=q4_0. Default is now q8_0: nearly
-# free quality-wise, roughly halves KV memory at 64k ctx (requires flash_attn,
-# which is on). Set QWEN_KV_TYPE_K=0 QWEN_KV_TYPE_V=0 to go back to f16.
-KV_TYPE_K = int(os.environ.get("QWEN_KV_TYPE_K", "8"))
-KV_TYPE_V = int(os.environ.get("QWEN_KV_TYPE_V", "8"))
+# Prefill chunk size MLX pushes through Metal per step. 2048 mirrors the GGUF
+# server's n_ubatch; try 4096 on M4 Max (cheap A/B, watch the prefill t/s log).
+PREFILL_STEP = int(os.environ.get("QWEN_PREFILL_STEP", "2048"))
 
-# Prompt-lookup speculative decoding — OFF by default. In llama-cpp-python,
-# attaching a draft_model makes generate() request logits for EVERY token in
-# the batch and write them into Llama.scores, which is only allocated with
-# logits_all=True; without it you get
-#   ValueError: could not broadcast input array from shape (N,) into shape (0,)
-# on the first decode (N = n_ubatch * n_vocab). And logits_all=True needs
-# n_ctx * n_vocab * 4 bytes (~60GB at 64k ctx) — prohibitive. Leave this off
-# unless you're on a small context and know your build handles it.
-USE_PROMPT_LOOKUP = os.environ.get("QWEN_PROMPT_LOOKUP", "0") == "1"
-PROMPT_LOOKUP_TOKENS = int(os.environ.get("QWEN_PROMPT_LOOKUP_TOKENS", "10"))
+# Prompt-cache slots. 2 = agent loop + one side request without mutual
+# eviction. Each slot holds fp16 KV for its full prompt (~a few GB at 30k
+# tokens), so raise this only if memory allows.
+CACHE_SLOTS = int(os.environ.get("QWEN_CACHE_SLOTS", "2"))
+# A request "matches" a slot only if it shares at least this many prefix
+# tokens; otherwise it's treated as a new conversation (fresh/LRU slot).
+MIN_PREFIX = int(os.environ.get("QWEN_MIN_PREFIX", "1024"))
 
-# Global thinking kill-switch. QWEN_THINKING=0 renders the template with
-# enable_thinking=False on every request — big latency win in agent loops at
-# some planning-quality cost. Per-request enable_thinking/reasoning_effort
-# from the client still take precedence.
+# Optional: ask MLX to wire its GPU buffers (resists page eviction between
+# turns). Set to e.g. 56 (GB). Requires the sysctl above to be raised first.
+WIRED_GB = float(os.environ.get("QWEN_WIRED_GB", "0"))
+
+# Global thinking kill-switch (same semantics as GGUF server).
 THINKING_DEFAULT = os.environ.get("QWEN_THINKING", "1") == "1"
 
-# Optional cross-conversation prefix cache (see header). Off by default.
-USE_RAM_CACHE = os.environ.get("QWEN_RAM_CACHE", "0") == "1"
-RAM_CACHE_GB = float(os.environ.get("QWEN_RAM_CACHE_GB", "16"))
-LLAMA_VERBOSE = os.environ.get("QWEN_LLAMA_VERBOSE", "0") == "1"
-
-# Per-request chat logging for visibility: writes one JSON per request into
-# ./chats (relative to wherever you launch the server), containing the raw
-# OpenAI messages, the EXACT rendered prompt string fed to llama.cpp, and the
-# full response (reasoning / content / tool calls). Toggle: QWEN_CHAT_LOG=1.
-CHAT_LOG = os.environ.get("QWEN_CHAT_LOG", "0") == "1"
+# Per-request chat logging into ./chats (same format as GGUF server).
+CHAT_LOG = os.environ.get("QWEN_CHAT_LOG", "1") == "1"
 CHAT_LOG_DIR = os.environ.get("QWEN_CHAT_LOG_DIR", os.path.join(os.getcwd(), "chats"))
-# 0 = store full rendered prompt when QWEN_CHAT_LOG=1. For lower overhead while
-# debugging, set e.g. QWEN_CHAT_LOG_PROMPT_CHARS=4000.
-CHAT_LOG_PROMPT_CHARS = int(os.environ.get("QWEN_CHAT_LOG_PROMPT_CHARS", "0"))
 
-# Qwen3.6 thinking-mode sampling. Coding-leaning defaults; presence_penalty is
-# the recommended anti-loop knob (Qwen3.6 suggests up to ~1.5 in thinking mode).
+# Qwen3.6 sampling defaults (coding-leaning, same as GGUF server).
 DEF_TEMP = float(os.environ.get("QWEN_TEMP", "0.7"))
 DEF_TOP_P = float(os.environ.get("QWEN_TOP_P", "0.8"))
 DEF_TOP_K = int(os.environ.get("QWEN_TOP_K", "20"))
 DEF_MIN_P = float(os.environ.get("QWEN_MIN_P", "0.0"))
 DEF_REPEAT = float(os.environ.get("QWEN_REPEAT_PENALTY", "1.05"))
 DEF_PRESENCE = float(os.environ.get("QWEN_PRESENCE_PENALTY", "1.5"))
-DEF_FREQUENCY = float(os.environ.get("QWEN_FREQUENCY_PENALTY", "0.0"))
 
-# llama-cpp-python's Llama object is not safe for concurrent calls, and a stream
-# generator must be drained on the thread that created it. Pin all model work to
-# one worker; this also serializes overlapping requests AND lets llama.cpp reuse
-# the shared KV prefix across agent turns (free prefix caching). NOTE: that
-# automatic reuse is "previous request only" — if two conversations interleave,
-# they evict each other. QWEN_RAM_CACHE=1 papers over that at a memory cost.
-GPU = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llama")
+# All MLX/Metal work happens on this one thread. SSE generators only drain a
+# queue (pure Python). Never call model code from another thread.
+GPU = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
+
+
+def _set_wired_limit():
+    if not WIRED_GB:
+        return
+    nbytes = int(WIRED_GB * (1 << 30))
+    for fn in ("set_wired_limit",):
+        try:
+            getattr(mx, fn)(nbytes)
+            print(f"[qwen-server] MLX wired limit set to {WIRED_GB:g} GB")
+            return
+        except AttributeError:
+            pass
+        except Exception as e:
+            print(f"[qwen-server] could not set wired limit: {e!r}")
+            return
+    try:
+        mx.metal.set_wired_limit(nbytes)  # older MLX
+        print(f"[qwen-server] MLX wired limit set to {WIRED_GB:g} GB (metal API)")
+    except Exception as e:
+        print(f"[qwen-server] wired limit unavailable: {e!r}")
 
 
 def _load():
-    print(f"[qwen-server] loading GGUF {GGUF_PATH} (n_ctx={N_CTX}, ngl={N_GPU_LAYERS}, "
-          f"n_batch={N_BATCH}, n_ubatch={N_UBATCH}, threads={N_THREADS or 'auto'}, "
-          f"threads_batch={N_THREADS_BATCH or 'auto'}, kv={KV_TYPE_K}/{KV_TYPE_V}) ...")
-    kw: Dict[str, Any] = dict(
-        model_path=GGUF_PATH, n_ctx=N_CTX, n_gpu_layers=N_GPU_LAYERS,
-        n_batch=N_BATCH, n_ubatch=N_UBATCH, flash_attn=True, verbose=LLAMA_VERBOSE,
-    )
-    if N_THREADS:
-        kw["n_threads"] = int(N_THREADS)
-    if N_THREADS_BATCH:
-        kw["n_threads_batch"] = int(N_THREADS_BATCH)
-    if KV_TYPE_K:
-        kw["type_k"] = KV_TYPE_K
-    if KV_TYPE_V:
-        kw["type_v"] = KV_TYPE_V
-    if USE_PROMPT_LOOKUP:
-        try:
-            from llama_cpp.llama_speculative import LlamaPromptLookupDecoding
-            kw["draft_model"] = LlamaPromptLookupDecoding(num_pred_tokens=PROMPT_LOOKUP_TOKENS)
-            print(f"[qwen-server] prompt-lookup decoding on (n={PROMPT_LOOKUP_TOKENS})")
-        except Exception as e:
-            print(f"[qwen-server] prompt-lookup unavailable, continuing without: {e!r}")
-    model = Llama(**kw)
-    if USE_RAM_CACHE:
-        try:
-            from llama_cpp import LlamaRAMCache
-            model.set_cache(LlamaRAMCache(capacity_bytes=int(RAM_CACHE_GB * (1 << 30))))
-            print(f"[qwen-server] RAM prefix cache on ({RAM_CACHE_GB:g} GB) — watch memory")
-        except Exception as e:
-            print(f"[qwen-server] RAM cache unavailable, continuing without: {e!r}")
-    return model
+    _set_wired_limit()
+    print(f"[qwen-server] loading MLX model {MODEL_PATH} ...")
+    model, tokenizer = load(MODEL_PATH)
+    return model, tokenizer
 
 
-llm = GPU.submit(_load).result()
-tok = AutoTokenizer.from_pretrained(TOKENIZER)
-print(f"[qwen-server] ready. model id: {MODEL_ID}")
+model, tok = GPU.submit(_load).result()
+print(f"[qwen-server] ready. model id: {MODEL_ID} "
+      f"(slots={CACHE_SLOTS}, prefill_step={PREFILL_STEP})")
 
 app = FastAPI()
+
+
+# --------------------------------------------------------------------------- #
+# Prompt-cache slots (explicit, observable prefix reuse)
+# --------------------------------------------------------------------------- #
+class _Slot:
+    __slots__ = ("idx", "cache", "tokens", "last_used")
+
+    def __init__(self, idx: int):
+        self.idx = idx
+        self.cache = make_prompt_cache(model)
+        self.tokens: List[int] = []   # ledger of tokens the cache contains
+        self.last_used = 0.0
+
+    def reset(self):
+        self.cache = make_prompt_cache(model)
+        self.tokens = []
+
+
+_SLOTS: List[_Slot] = []
+
+
+def _common_prefix(a: List[int], b: List[int]) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def _acquire_slot(tokens: List[int]) -> Tuple[_Slot, int]:
+    """Pick the slot with the longest common prefix; spawn or LRU-recycle a
+    slot if nothing matches meaningfully. Returns (slot, usable_prefix_len).
+    Worker thread only."""
+    best, best_k = None, -1
+    for s in _SLOTS:
+        k = _common_prefix(s.tokens, tokens)
+        if k > best_k:
+            best, best_k = s, k
+    if best is not None and best_k >= MIN_PREFIX:
+        return best, best_k
+    if len(_SLOTS) < CACHE_SLOTS:
+        s = _Slot(len(_SLOTS))
+        _SLOTS.append(s)
+        return s, 0
+    s = min(_SLOTS, key=lambda x: x.last_used)   # LRU recycle
+    s.reset()
+    return s, 0
+
+
+def _prepare_slot(slot: _Slot, tokens: List[int], k: int) -> Tuple[List[int], int]:
+    """Trim the slot's cache down to the common prefix and return the suffix
+    that still needs prefilling. Always leaves >=1 token to evaluate (MLX
+    needs at least one forward pass to produce logits)."""
+    if k >= len(tokens):
+        k = len(tokens) - 1
+    n_trim = len(slot.tokens) - k
+    if n_trim > 0:
+        if can_trim_prompt_cache(slot.cache):
+            trim_prompt_cache(slot.cache, n_trim)
+            slot.tokens = slot.tokens[:k]
+        else:
+            slot.reset()
+            k = 0
+    return tokens[k:], k
+
+
+def _sync_slot(slot: _Slot, prompt_tokens: List[int], gen_ids: List[int]):
+    """Sync the slot ledger from the cache's ACTUAL offset after generation.
+    stream_generate's final sampled token is never evaluated into the cache
+    (and the last loop token can be double-reported), so instead of trusting
+    arithmetic we read cache[0].offset as ground truth and take that prefix
+    of (prompt + generated). Any inconsistency -> reset rather than risk a
+    corrupted reuse next turn."""
+    try:
+        n_cached = int(slot.cache[0].offset)
+        full = prompt_tokens + gen_ids
+        if 0 <= n_cached <= len(full):
+            slot.tokens = full[:n_cached]
+        else:
+            slot.reset()
+    except Exception:
+        slot.reset()
+    slot.last_used = time.time()
 
 
 # --------------------------------------------------------------------------- #
@@ -236,9 +257,8 @@ def _text_of(content: Any) -> str:
 def _normalize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Flatten list-style content; convert OpenAI tool_call JSON-string arguments
     into dicts (the Qwen template iterates the object, and passing a string trips
-    the well-known 'Can only get item pairs from a mapping' template crash).
-    Preserve reasoning_content on assistant turns so preserve_thinking has
-    something to keep if the client replays it (harmless otherwise)."""
+    the 'Can only get item pairs from a mapping' template crash). Preserve
+    reasoning_content on assistant turns for preserve_thinking."""
     out: List[Dict[str, Any]] = []
     for m in messages:
         role = m.get("role")
@@ -288,8 +308,6 @@ def build_prompt(body: Dict[str, Any]) -> str:
         else:
             enable_thinking = THINKING_DEFAULT
 
-    # preserve_thinking helps Qwen3.6 in multi-turn agent loops; let the client
-    # override via chat_template_kwargs.
     extra = {"preserve_thinking": True}
     extra.update(dict(body.get("chat_template_kwargs") or {}))
 
@@ -298,7 +316,6 @@ def build_prompt(body: Dict[str, Any]) -> str:
             messages, tools=tools, add_generation_prompt=True, tokenize=False, **kw
         )
 
-    # Degrade gracefully if a given template doesn't accept a kwarg.
     for attempt in (
         dict(enable_thinking=enable_thinking, **extra),
         dict(enable_thinking=enable_thinking),
@@ -322,7 +339,7 @@ def _starts_in_think(prompt: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Qwen3-Coder XML tool-call parsing
+# Qwen3-Coder XML tool-call parsing (identical to GGUF server)
 # --------------------------------------------------------------------------- #
 _FUNC_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)(?:</function>|$)", re.DOTALL)
 _PARAM_RE = re.compile(
@@ -340,9 +357,6 @@ def _strip_wrap_newlines(v: str) -> str:
 
 
 def _coerce(val: str, schema: Optional[Dict[str, Any]]) -> Any:
-    """Coerce a raw XML parameter string into the type the tool schema expects.
-    The model emits everything as text; Copilot validates against the schema, so
-    a string '3' for an integer param (or 'true' for a bool) must be converted."""
     t = (schema or {}).get("type")
     s = val.strip()
     try:
@@ -356,7 +370,6 @@ def _coerce(val: str, schema: Optional[Dict[str, Any]]) -> Any:
             return json.loads(s)
         if t == "string":
             return _strip_wrap_newlines(val)
-        # Unknown/absent schema: best-effort JSON, else keep as text.
         return json.loads(s)
     except Exception:
         return _strip_wrap_newlines(val)
@@ -373,10 +386,7 @@ def _props_for(func_name: str, tools: Optional[List[Dict[str, Any]]]) -> Dict[st
 
 
 def parse_tool_block(raw: str, tools: Optional[List[Dict[str, Any]]]) -> Tuple[str, Dict[str, Any]]:
-    """Parse the inside of a <tool_call>...</tool_call> block.
-    Tries Qwen3-Coder XML first, falls back to Hermes JSON."""
     raw = raw.strip()
-
     fm = _FUNC_RE.search(raw)
     if fm:
         name = fm.group(1).strip()
@@ -387,8 +397,6 @@ def parse_tool_block(raw: str, tools: Optional[List[Dict[str, Any]]]) -> Tuple[s
             key = pm.group(1).strip()
             args[key] = _coerce(pm.group(2), props.get(key))
         return name, args
-
-    # Fallback: Hermes JSON ({"name": ..., "arguments": {...}})
     try:
         obj = json.loads(raw)
         name = obj.get("name", "")
@@ -407,11 +415,6 @@ def parse_tool_block(raw: str, tools: Optional[List[Dict[str, Any]]]) -> Tuple[s
 # Streaming parser: Qwen text stream -> reasoning / content / tool_calls
 # --------------------------------------------------------------------------- #
 class QwenStreamParser:
-    """Qwen emits optional <think>...</think> first, then content that may
-    contain <tool_call>...</tool_call> blocks (Coder XML inside). feed(delta)
-    returns ("reasoning"|"content", str) events to stream now; finish() flushes
-    tool calls."""
-
     _MARKERS = ("<think>", "</think>", "<tool_call>", "</tool_call>")
     _HOLD = max(len(m) for m in _MARKERS) - 1
 
@@ -488,42 +491,29 @@ class QwenStreamParser:
 
 
 # --------------------------------------------------------------------------- #
-# Inference: stream text deltas out of llama.cpp (+ perf instrumentation)
+# Sampling
 # --------------------------------------------------------------------------- #
-def _tokenize_prompt(prompt: str) -> List[int]:
-    """Tokenize exactly once for the hot path.
-
-    Passing the resulting token IDs into create_completion() avoids a second
-    full-prompt tokenization inside llama-cpp-python and makes the reuse metric
-    compare against the same token stream that generation receives.
-    """
-    return list(llm.tokenize(prompt.encode("utf-8"), add_bos=False, special=True))
-
-
-def _prefix_reuse_stats_tokens(toks: List[int]) -> Tuple[int, int]:
-    """(n_prompt_tokens, n_reused_from_current_llama_state).
-
-    This is still a diagnostic, not a replacement for llama.cpp's internal
-    cache accounting. It is now based on the exact token list passed to
-    create_completion(), so it no longer disagrees with the generation call
-    because of duplicate/string-path tokenization differences.
-    """
-    try:
-        n_prompt = len(toks)
-        prev = np.asarray(llm._input_ids[: llm.n_tokens]) if llm.n_tokens else np.empty(0, dtype=np.int64)
-        n = min(len(prev), n_prompt)
-        if n == 0:
-            return n_prompt, 0
-        cur = np.asarray(toks[:n])
-        mismatch = np.nonzero(prev[:n] != cur)[0]
-        reused = int(mismatch[0]) if mismatch.size else n
-        return n_prompt, reused
-    except Exception:
-        return -1, 0
+def _presence_processor(penalty: float, context: int = 512):
+    """Additive OpenAI-style presence penalty over recently seen tokens.
+    mlx_lm only ships multiplicative repetition_penalty; Qwen3.6's recommended
+    anti-loop knob is presence, so implement it as a logits processor."""
+    def proc(toks, logits):
+        try:
+            if toks is None or toks.size == 0:
+                return logits
+            recent = toks[-context:]
+            logits[:, recent] = logits[:, recent] - penalty
+        except Exception:
+            pass
+        return logits
+    return proc
 
 
-def run_text(prompt: str, body: Dict[str, Any]):
-    """Yield generated text deltas (worker thread only)."""
+# --------------------------------------------------------------------------- #
+# Inference: stream text deltas out of MLX (+ perf instrumentation)
+# --------------------------------------------------------------------------- #
+def run_mlx(prompt: str, body: Dict[str, Any]):
+    """Yield generated text deltas. WORKER THREAD ONLY (all Metal work)."""
     def pick(key, default, cast):
         v = body.get(key)
         return default if v is None else cast(v)
@@ -534,61 +524,57 @@ def run_text(prompt: str, body: Dict[str, Any]):
     min_p = pick("min_p", DEF_MIN_P, float)
     repeat = pick("repetition_penalty", DEF_REPEAT, float)
     presence = pick("presence_penalty", DEF_PRESENCE, float)
-    frequency = pick("frequency_penalty", DEF_FREQUENCY, float)
     max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens")
                      or DEFAULT_MAX_TOKENS)
 
-    t_tok0 = time.perf_counter()
-    prompt_tokens = _tokenize_prompt(prompt)
-    tok_s = time.perf_counter() - t_tok0
+    tokens: List[int] = tok.encode(prompt)
+    slot, k = _acquire_slot(tokens)
+    suffix, k = _prepare_slot(slot, tokens, k)
+    n_prompt = len(tokens)
+    pct = (100 * k // n_prompt) if n_prompt else 0
+    print(f"[qwen-server] slot={slot.idx} prompt={n_prompt}t "
+          f"kv-reuse={k}t ({pct}%) prefill={len(suffix)}t")
 
-    n_prompt, reused = _prefix_reuse_stats_tokens(prompt_tokens)
-    to_prefill = (n_prompt - reused) if n_prompt >= 0 else -1
-    if n_prompt >= 0:
-        pct = (100 * reused // n_prompt) if n_prompt else 0
-        print(f"[qwen-server] prompt={n_prompt}t kv-reuse-est={reused}t ({pct}%) "
-              f"eval-tail~{to_prefill}t tokenize={tok_s:.3f}s")
+    sampler = make_sampler(temp=temp, top_p=top_p, min_p=min_p, top_k=top_k)
+    processors = make_logits_processors(
+        repetition_penalty=repeat if repeat and repeat != 1.0 else None,
+        repetition_context_size=256,
+    ) or []
+    if presence:
+        processors.append(_presence_processor(presence))
 
     t0 = time.perf_counter()
     t_first = None
-    n_chunks = 0
-    n_prompt_before = n_prompt
-    for out in llm.create_completion(
-        prompt_tokens, max_tokens=max_tokens, temperature=temp, top_p=top_p,
-        top_k=top_k, min_p=min_p, repeat_penalty=repeat,
-        presence_penalty=presence, frequency_penalty=frequency,
-        stop=["<|im_end|>"], stream=True,
-    ):
-        piece = out["choices"][0].get("text", "")
-        if piece:
-            if t_first is None:
-                t_first = time.perf_counter()
-                dt = t_first - t0
-                # Do not treat this as a pure prompt-eval benchmark. When the
-                # eval tail is tiny, TTFT is dominated by fixed overhead and
-                # first-token sampling, so apparent tok/s can look bad despite
-                # successful cache reuse.
-                tail_rate = (to_prefill / dt) if (to_prefill > 0 and dt > 0) else 0
-                print(f"[qwen-server] TTFT={dt:.2f}s"
-                      + (f" (eval-tail/TTFT~{tail_rate:.0f} t/s; diagnostic only)" if tail_rate else ""))
-            n_chunks += 1
-            yield piece
+    n_out = 0
+    gen_ids: List[int] = []
+    try:
+        for resp in stream_generate(
+            model, tok, prompt=suffix,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            logits_processors=processors,
+            prompt_cache=slot.cache,
+            prefill_step_size=PREFILL_STEP,
+        ):
+            gen_ids.append(resp.token)
+            piece = resp.text
+            if piece:
+                if t_first is None:
+                    t_first = time.perf_counter()
+                    dt = t_first - t0
+                    tps = getattr(resp, "prompt_tps", 0) or 0
+                    print(f"[qwen-server] TTFT={dt:.2f}s"
+                          + (f" (prefill ~{tps:.0f} t/s)" if tps else ""))
+                n_out += 1
+                yield piece
+    finally:
+        # Always resync the ledger from the cache's real state, even on error.
+        _sync_slot(slot, tokens, gen_ids)
+
     t_end = time.perf_counter()
-    if t_first is not None and t_end > t_first:
-        # Best-effort generated-token estimate from llama state; avoids
-        # per-delta tokenization overhead. If it is not meaningful for a given
-        # llama-cpp-python version, fall back to chunk count.
-        gen_est = -1
-        try:
-            if n_prompt_before >= 0 and llm.n_tokens >= n_prompt_before:
-                gen_est = int(llm.n_tokens - n_prompt_before)
-        except Exception:
-            pass
-        if gen_est > 0:
-            print(f"[qwen-server] decode: {gen_est}t in {t_end - t_first:.2f}s "
-                  f"(~{gen_est / (t_end - t_first):.1f} t/s, {n_chunks} chunks)")
-        elif n_chunks:
-            print(f"[qwen-server] decode: {n_chunks} chunks in {t_end - t_first:.2f}s")
+    if t_first is not None and n_out > 1 and t_end > t_first:
+        print(f"[qwen-server] decode: {n_out} chunks in {t_end - t_first:.2f}s "
+              f"(~{n_out / (t_end - t_first):.1f} t/s)")
 
 
 # --------------------------------------------------------------------------- #
@@ -597,10 +583,6 @@ def run_text(prompt: str, body: Dict[str, Any]):
 def _log_chat(cid: str, created: int, body: Dict[str, Any], prompt: str,
               reasoning: str, content: str, tool_calls: List[Dict[str, Any]],
               stream: bool, duration_s: float):
-    """Dump everything the model saw and everything it produced for one
-    request. 'rendered_prompt' is the literal string handed to llama.cpp
-    (post chat-template), i.e. exactly what the model sees. Best-effort:
-    logging failures never break a request."""
     if not CHAT_LOG:
         return
     try:
@@ -619,14 +601,7 @@ def _log_chat(cid: str, created: int, body: Dict[str, Any], prompt: str,
             "tools": [(t.get("function", t) or {}).get("name")
                       for t in (body.get("tools") or [])],
             "messages": body.get("messages"),
-            "rendered_prompt": (
-                prompt if CHAT_LOG_PROMPT_CHARS <= 0
-                else prompt[:CHAT_LOG_PROMPT_CHARS]
-            ),
-            "rendered_prompt_truncated": (
-                len(prompt) > CHAT_LOG_PROMPT_CHARS if CHAT_LOG_PROMPT_CHARS > 0 else False
-            ),
-            "rendered_prompt_chars": len(prompt),
+            "rendered_prompt": prompt,
             "response": {
                 "reasoning_content": reasoning or None,
                 "content": content or None,
@@ -667,7 +642,7 @@ async def chat_completions(request: Request):
         def generate_all():
             parser = QwenStreamParser(initial_mode=init_mode, tools=tools)
             reasoning, content = "", ""
-            for delta in run_text(prompt, body):
+            for delta in run_mlx(prompt, body):
                 for kind, txt in parser.feed(delta):
                     if kind == "reasoning":
                         reasoning += txt
@@ -698,16 +673,16 @@ async def chat_completions(request: Request):
         })
 
     # Streaming: producer runs generation on the worker thread, pushing text
-    # deltas to a queue; the SSE generator only drains the queue and parses
-    # (pure Python, thread-safe). No llama.cpp call leaves the worker.
+    # deltas to a queue; the SSE generator only drains the queue and parses.
+    # No MLX call ever leaves the worker thread.
     def sse():
         parser = QwenStreamParser(initial_mode=init_mode, tools=tools)
         q: "queue.Queue" = queue.Queue(maxsize=256)
-        acc_reasoning, acc_content = [], []   # accumulated for the chat log
+        acc_reasoning, acc_content = [], []
 
         def produce():
             try:
-                for delta in run_text(prompt, body):
+                for delta in run_mlx(prompt, body):
                     q.put(("txt", delta))
             except Exception as e:
                 q.put(("err", repr(e)))
