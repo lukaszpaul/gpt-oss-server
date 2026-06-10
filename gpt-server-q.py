@@ -5,7 +5,7 @@ Apple Silicon via llama-cpp-python, built so GitHub Copilot's Custom Endpoint
 treats it like a native model: tool calling, agent/plan mode, clean formatting
 (reasoning never leaks into the answer).
 
-PERF NOTES (this revision — tuned for Copilot's ~30k-token agent prompts)
+PERF NOTES (patched — tuned for Copilot's ~30k-token agent prompts)
   The dominant cost is PREFILL of the huge Copilot prompt, not decode. Three
   levers, in order of impact:
 
@@ -115,6 +115,7 @@ N_GPU_LAYERS = int(os.environ.get("QWEN_NGL", "-1"))     # -1 = offload all to M
 N_BATCH = int(os.environ.get("QWEN_N_BATCH", "2048"))
 N_UBATCH = int(os.environ.get("QWEN_N_UBATCH", str(N_BATCH)))
 N_THREADS = os.environ.get("QWEN_N_THREADS")             # set to P-core count (M4 Max: ~12); None = auto
+N_THREADS_BATCH = os.environ.get("QWEN_N_THREADS_BATCH") # batch/prompt CPU-side helpers; try same as P-core count
 DEFAULT_MAX_TOKENS = int(os.environ.get("QWEN_MAX_TOKENS", "4096"))
 
 # KV-cache quantization. 0=f16, 8=q8_0, 2=q4_0. Default is now q8_0: nearly
@@ -143,13 +144,17 @@ THINKING_DEFAULT = os.environ.get("QWEN_THINKING", "1") == "1"
 # Optional cross-conversation prefix cache (see header). Off by default.
 USE_RAM_CACHE = os.environ.get("QWEN_RAM_CACHE", "0") == "1"
 RAM_CACHE_GB = float(os.environ.get("QWEN_RAM_CACHE_GB", "16"))
+LLAMA_VERBOSE = os.environ.get("QWEN_LLAMA_VERBOSE", "0") == "1"
 
 # Per-request chat logging for visibility: writes one JSON per request into
 # ./chats (relative to wherever you launch the server), containing the raw
 # OpenAI messages, the EXACT rendered prompt string fed to llama.cpp, and the
-# full response (reasoning / content / tool calls). Toggle: QWEN_CHAT_LOG=0.
-CHAT_LOG = os.environ.get("QWEN_CHAT_LOG", "1") == "1"
+# full response (reasoning / content / tool calls). Toggle: QWEN_CHAT_LOG=1.
+CHAT_LOG = os.environ.get("QWEN_CHAT_LOG", "0") == "1"
 CHAT_LOG_DIR = os.environ.get("QWEN_CHAT_LOG_DIR", os.path.join(os.getcwd(), "chats"))
+# 0 = store full rendered prompt when QWEN_CHAT_LOG=1. For lower overhead while
+# debugging, set e.g. QWEN_CHAT_LOG_PROMPT_CHARS=4000.
+CHAT_LOG_PROMPT_CHARS = int(os.environ.get("QWEN_CHAT_LOG_PROMPT_CHARS", "0"))
 
 # Qwen3.6 thinking-mode sampling. Coding-leaning defaults; presence_penalty is
 # the recommended anti-loop knob (Qwen3.6 suggests up to ~1.5 in thinking mode).
@@ -172,13 +177,16 @@ GPU = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llama")
 
 def _load():
     print(f"[qwen-server] loading GGUF {GGUF_PATH} (n_ctx={N_CTX}, ngl={N_GPU_LAYERS}, "
-          f"n_batch={N_BATCH}, n_ubatch={N_UBATCH}, kv={KV_TYPE_K}/{KV_TYPE_V}) ...")
+          f"n_batch={N_BATCH}, n_ubatch={N_UBATCH}, threads={N_THREADS or 'auto'}, "
+          f"threads_batch={N_THREADS_BATCH or 'auto'}, kv={KV_TYPE_K}/{KV_TYPE_V}) ...")
     kw: Dict[str, Any] = dict(
         model_path=GGUF_PATH, n_ctx=N_CTX, n_gpu_layers=N_GPU_LAYERS,
-        n_batch=N_BATCH, n_ubatch=N_UBATCH, flash_attn=True, verbose=False,
+        n_batch=N_BATCH, n_ubatch=N_UBATCH, flash_attn=True, verbose=LLAMA_VERBOSE,
     )
     if N_THREADS:
         kw["n_threads"] = int(N_THREADS)
+    if N_THREADS_BATCH:
+        kw["n_threads_batch"] = int(N_THREADS_BATCH)
     if KV_TYPE_K:
         kw["type_k"] = KV_TYPE_K
     if KV_TYPE_V:
@@ -482,12 +490,25 @@ class QwenStreamParser:
 # --------------------------------------------------------------------------- #
 # Inference: stream text deltas out of llama.cpp (+ perf instrumentation)
 # --------------------------------------------------------------------------- #
-def _prefix_reuse_stats(prompt: str) -> Tuple[int, int]:
-    """(n_prompt_tokens, n_reused_from_kv). Mirrors the comparison llama.cpp
-    does internally so we can SEE whether Copilot's prompt is cache-friendly.
-    Best-effort: any failure just disables the metric."""
+def _tokenize_prompt(prompt: str) -> List[int]:
+    """Tokenize exactly once for the hot path.
+
+    Passing the resulting token IDs into create_completion() avoids a second
+    full-prompt tokenization inside llama-cpp-python and makes the reuse metric
+    compare against the same token stream that generation receives.
+    """
+    return list(llm.tokenize(prompt.encode("utf-8"), add_bos=False, special=True))
+
+
+def _prefix_reuse_stats_tokens(toks: List[int]) -> Tuple[int, int]:
+    """(n_prompt_tokens, n_reused_from_current_llama_state).
+
+    This is still a diagnostic, not a replacement for llama.cpp's internal
+    cache accounting. It is now based on the exact token list passed to
+    create_completion(), so it no longer disagrees with the generation call
+    because of duplicate/string-path tokenization differences.
+    """
     try:
-        toks = llm.tokenize(prompt.encode("utf-8"), add_bos=False, special=True)
         n_prompt = len(toks)
         prev = np.asarray(llm._input_ids[: llm.n_tokens]) if llm.n_tokens else np.empty(0, dtype=np.int64)
         n = min(len(prev), n_prompt)
@@ -517,17 +538,23 @@ def run_text(prompt: str, body: Dict[str, Any]):
     max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens")
                      or DEFAULT_MAX_TOKENS)
 
-    n_prompt, reused = _prefix_reuse_stats(prompt)
+    t_tok0 = time.perf_counter()
+    prompt_tokens = _tokenize_prompt(prompt)
+    tok_s = time.perf_counter() - t_tok0
+
+    n_prompt, reused = _prefix_reuse_stats_tokens(prompt_tokens)
     to_prefill = (n_prompt - reused) if n_prompt >= 0 else -1
     if n_prompt >= 0:
         pct = (100 * reused // n_prompt) if n_prompt else 0
-        print(f"[qwen-server] prompt={n_prompt}t kv-reuse={reused}t ({pct}%) prefill~{to_prefill}t")
+        print(f"[qwen-server] prompt={n_prompt}t kv-reuse-est={reused}t ({pct}%) "
+              f"eval-tail~{to_prefill}t tokenize={tok_s:.3f}s")
 
     t0 = time.perf_counter()
     t_first = None
-    n_out = 0
+    n_chunks = 0
+    n_prompt_before = n_prompt
     for out in llm.create_completion(
-        prompt, max_tokens=max_tokens, temperature=temp, top_p=top_p,
+        prompt_tokens, max_tokens=max_tokens, temperature=temp, top_p=top_p,
         top_k=top_k, min_p=min_p, repeat_penalty=repeat,
         presence_penalty=presence, frequency_penalty=frequency,
         stop=["<|im_end|>"], stream=True,
@@ -537,15 +564,31 @@ def run_text(prompt: str, body: Dict[str, Any]):
             if t_first is None:
                 t_first = time.perf_counter()
                 dt = t_first - t0
-                rate = (to_prefill / dt) if (to_prefill > 0 and dt > 0) else 0
+                # Do not treat this as a pure prompt-eval benchmark. When the
+                # eval tail is tiny, TTFT is dominated by fixed overhead and
+                # first-token sampling, so apparent tok/s can look bad despite
+                # successful cache reuse.
+                tail_rate = (to_prefill / dt) if (to_prefill > 0 and dt > 0) else 0
                 print(f"[qwen-server] TTFT={dt:.2f}s"
-                      + (f" (~{rate:.0f} t/s prefill)" if rate else ""))
-            n_out += 1
+                      + (f" (eval-tail/TTFT~{tail_rate:.0f} t/s; diagnostic only)" if tail_rate else ""))
+            n_chunks += 1
             yield piece
     t_end = time.perf_counter()
-    if t_first is not None and n_out > 1 and t_end > t_first:
-        print(f"[qwen-server] decode: {n_out} chunks in {t_end - t_first:.2f}s "
-              f"(~{n_out / (t_end - t_first):.1f} t/s)")
+    if t_first is not None and t_end > t_first:
+        # Best-effort generated-token estimate from llama state; avoids
+        # per-delta tokenization overhead. If it is not meaningful for a given
+        # llama-cpp-python version, fall back to chunk count.
+        gen_est = -1
+        try:
+            if n_prompt_before >= 0 and llm.n_tokens >= n_prompt_before:
+                gen_est = int(llm.n_tokens - n_prompt_before)
+        except Exception:
+            pass
+        if gen_est > 0:
+            print(f"[qwen-server] decode: {gen_est}t in {t_end - t_first:.2f}s "
+                  f"(~{gen_est / (t_end - t_first):.1f} t/s, {n_chunks} chunks)")
+        elif n_chunks:
+            print(f"[qwen-server] decode: {n_chunks} chunks in {t_end - t_first:.2f}s")
 
 
 # --------------------------------------------------------------------------- #
@@ -576,7 +619,14 @@ def _log_chat(cid: str, created: int, body: Dict[str, Any], prompt: str,
             "tools": [(t.get("function", t) or {}).get("name")
                       for t in (body.get("tools") or [])],
             "messages": body.get("messages"),
-            "rendered_prompt": prompt,
+            "rendered_prompt": (
+                prompt if CHAT_LOG_PROMPT_CHARS <= 0
+                else prompt[:CHAT_LOG_PROMPT_CHARS]
+            ),
+            "rendered_prompt_truncated": (
+                len(prompt) > CHAT_LOG_PROMPT_CHARS if CHAT_LOG_PROMPT_CHARS > 0 else False
+            ),
+            "rendered_prompt_chars": len(prompt),
             "response": {
                 "reasoning_content": reasoning or None,
                 "content": content or None,
