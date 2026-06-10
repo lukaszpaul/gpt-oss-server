@@ -10,16 +10,21 @@ WHY MLX (vs the llama-cpp-python version)
   prompt every turn despite >95% token-level prefix match. Here the prompt
   cache is EXPLICIT and owned by this script:
 
-  1. SLOT CACHE. QWEN_CACHE_SLOTS (default 2) independent prompt caches.
-     Each request is routed to the slot with the longest common token prefix,
-     so a Copilot side request (title gen, summarization) lands in its own
-     slot instead of evicting the agent loop's 30k-token prefix.
+  1. SLOT CACHE. QWEN_CACHE_SLOTS (default 3) independent prompt caches.
+     Each request is routed to the slot whose snapshot is the longest exact
+     prefix of the new prompt, so a Copilot side request (title gen,
+     summarization) lands in its own slot instead of evicting the agent
+     loop's 30k-token prefix.
 
-  2. EXACT TRIM + DELTA PREFILL. The chosen slot's cache is trimmed to the
-     common prefix (mlx_lm trim_prompt_cache), then ONLY the new suffix is
-     prefilled. After every request the slot's token ledger is synced from
-     the cache's actual offset — ground truth, not bookkeeping hope — so a
-     crash or partial generation can never silently corrupt reuse.
+  2. SNAPSHOT + DELTA PREFILL. Qwen3.6-A3B is a HYBRID model: most layers
+     are linear attention whose cache is a fixed-size recurrent state
+     (mlx_lm ArraysCache, no .offset) that can NEVER be trimmed back to an
+     earlier token position. So trim-based reuse is impossible; instead each
+     slot stores a SNAPSHOT of the cache taken right after prefilling the
+     prompt (minus a small holdback tail), BEFORE generation touches it.
+     Next turn: copy snapshot -> working cache (GPU state copy, tens of
+     ms), prefill only the new suffix, generate on the working copy, and
+     advance the snapshot.
 
   3. VISIBILITY. Every request logs: slot id, prompt tokens, reused tokens,
      suffix actually prefilled, TTFT, prefill t/s (from MLX itself), and
@@ -90,11 +95,11 @@ PREFILL_STEP = int(os.environ.get("QWEN_PREFILL_STEP", "2048"))
 # fire title gen AND summaries between agent turns) without mutual eviction.
 # Each slot holds fp16 KV for its full prompt (~a few GB at 30k tokens).
 CACHE_SLOTS = int(os.environ.get("QWEN_CACHE_SLOTS", "3"))
-# A request "matches" a slot only if it shares at least this many prefix
-# tokens; otherwise it's treated as a new conversation (fresh/LRU slot).
-# NOTE: kv-reuse=0 in the log can therefore mean "matched < MIN_PREFIX",
-# not literally zero — the divergence log (below) shows the true number.
-MIN_PREFIX = int(os.environ.get("QWEN_MIN_PREFIX", "1024"))
+# Snapshots exclude the last N prompt tokens. The prompt tail (generation
+# prompt, "<think>" opener) is re-rendered differently next turn, and a
+# recurrent state can't roll back, so we simply never cache the volatile
+# tail. Re-prefilling 64 tokens per turn is noise.
+SNAPSHOT_HOLDBACK = int(os.environ.get("QWEN_SNAPSHOT_HOLDBACK", "64"))
 
 # Cache diagnostics: when a request diverges from its best-matching slot,
 # print WHERE it diverged and the differing text on both sides. This is the
@@ -160,14 +165,26 @@ def _load():
 
 
 model, tok = GPU.submit(_load).result()
+_probe = make_prompt_cache(model)
+print(f"[qwen-server] cache layer types: "
+      f"{sorted(set(type(c).__name__ for c in _probe))}, "
+      f"trimmable={can_trim_prompt_cache(_probe)} -> snapshot caching")
+del _probe
 print(f"[qwen-server] ready. model id: {MODEL_ID} "
-      f"(slots={CACHE_SLOTS}, prefill_step={PREFILL_STEP})")
+      f"(slots={CACHE_SLOTS}, prefill_step={PREFILL_STEP}, "
+      f"holdback={SNAPSHOT_HOLDBACK})")
 
 app = FastAPI()
 
 
 # --------------------------------------------------------------------------- #
-# Prompt-cache slots (explicit, observable prefix reuse)
+# Prompt-cache slots — SNAPSHOT design (required for hybrid-attention models)
+#
+# Each slot stores a snapshot of the cache state for a prompt prefix, taken
+# BEFORE any generation. Reuse = copy snapshot to a working cache, prefill
+# only the suffix, generate on the copy. The snapshot itself is never
+# contaminated by generated tokens, so it never needs trimming — which is
+# the operation Qwen3.6's recurrent-state layers cannot do.
 # --------------------------------------------------------------------------- #
 class _Slot:
     __slots__ = ("idx", "cache", "tokens", "last_used")
@@ -195,18 +212,17 @@ def _common_prefix(a: List[int], b: List[int]) -> int:
 
 
 def _log_divergence(slot: "_Slot", tokens: List[int], k: int):
-    """Print where the new prompt stops matching the best slot, with the text
-    on both sides of the split. One glance identifies the churn source:
-    a timestamp, shuffled tool defs, editor state, etc."""
-    if k >= min(len(tokens), len(slot.tokens)):
-        return  # clean extension, nothing diverged
+    """Print where the new prompt stops matching a snapshot it could not
+    reuse, with the text on both sides of the split. One glance identifies
+    the churn source: a timestamp, shuffled tool defs, editor state, etc."""
+    if k >= len(slot.tokens):
+        return  # snapshot is a clean prefix — nothing diverged
     try:
         lo = max(0, k - 15)
         cached = tok.decode(slot.tokens[lo:k + 40])
         new = tok.decode(tokens[lo:k + 40])
-        pct = (100 * k // len(tokens)) if tokens else 0
-        print(f"[qwen-server] slot={slot.idx} best match {k}t/{len(tokens)}t "
-              f"({pct}%) — diverges at token {k}:\n"
+        print(f"[qwen-server] slot={slot.idx} diverges INSIDE snapshot at "
+              f"token {k}/{len(slot.tokens)} (snapshot unusable):\n"
               f"  cached: {cached!r}\n"
               f"  new:    {new!r}")
     except Exception:
@@ -214,71 +230,97 @@ def _log_divergence(slot: "_Slot", tokens: List[int], k: int):
 
 
 def _acquire_slot(tokens: List[int]) -> Tuple[_Slot, int]:
-    """Pick the slot with the longest common prefix; spawn or LRU-recycle a
-    slot if nothing matches meaningfully. Returns (slot, usable_prefix_len).
-    Worker thread only."""
-    best, best_k = None, -1
+    """Pick the slot whose snapshot is the longest EXACT prefix of the new
+    prompt. A partially-matching snapshot is unusable for a recurrent state
+    (no rollback), so it counts as zero. Worker thread only."""
+    best, best_usable = None, 0
+    best_partial, best_partial_k = None, -1
     for s in _SLOTS:
+        if not s.tokens:
+            continue
         k = _common_prefix(s.tokens, tokens)
-        if k > best_k:
-            best, best_k = s, k
-    if CACHE_DEBUG and best is not None and best.tokens:
-        _log_divergence(best, tokens, best_k)
-    if best is not None and best_k >= MIN_PREFIX:
-        return best, best_k
+        usable = len(s.tokens) if (k == len(s.tokens) and k < len(tokens)) else 0
+        if usable > best_usable:
+            best, best_usable = s, usable
+        if k > best_partial_k:
+            best_partial, best_partial_k = s, k
+    if best is not None:
+        return best, best_usable
+    if CACHE_DEBUG and best_partial is not None:
+        _log_divergence(best_partial, tokens, best_partial_k)
     if len(_SLOTS) < CACHE_SLOTS:
         s = _Slot(len(_SLOTS))
         _SLOTS.append(s)
         return s, 0
-    # All slots busy and nothing matched well: recycle the LRU slot, but keep
-    # whatever prefix it DOES share with this prompt instead of starting cold.
-    s = min(_SLOTS, key=lambda x: x.last_used)
-    k = _common_prefix(s.tokens, tokens)
-    if k > 0:
-        return s, k
+    s = min(_SLOTS, key=lambda x: x.last_used)   # LRU recycle, cold start
     s.reset()
     return s, 0
 
 
-def _prepare_slot(slot: _Slot, tokens: List[int], k: int) -> Tuple[List[int], int]:
-    """Trim the slot's cache down to the common prefix and return the suffix
-    that still needs prefilling. Always leaves >=1 token to evaluate (MLX
-    needs at least one forward pass to produce logits)."""
-    if k >= len(tokens):
-        k = len(tokens) - 1
-    n_trim = len(slot.tokens) - k
-    if n_trim > 0:
-        if can_trim_prompt_cache(slot.cache):
-            trim_prompt_cache(slot.cache, n_trim)
-            slot.tokens = slot.tokens[:k]
-        else:
-            slot.reset()
-            k = 0
-    return tokens[k:], k
+def _state_arrays(cache_list) -> List["mx.array"]:
+    """Collect every mx.array leaf in a prompt cache's state (handles
+    KVCache pairs, ArraysCache lists, and None entries alike)."""
+    out: List[mx.array] = []
+
+    def rec(x):
+        if isinstance(x, mx.array):
+            out.append(x)
+        elif isinstance(x, (list, tuple)):
+            for y in x:
+                rec(y)
+
+    for c in cache_list:
+        try:
+            rec(c.state)
+        except Exception:
+            pass
+    return out
 
 
-def _sync_slot(slot: _Slot, prompt_tokens: List[int], gen_ids: List[int]):
-    """Sync the slot ledger from the cache's ACTUAL offset after generation.
-    stream_generate's final sampled token is never evaluated into the cache
-    (and the last loop token can be double-reported), so instead of trusting
-    arithmetic we read cache[0].offset as ground truth and take that prefix
-    of (prompt + generated). Any inconsistency -> reset rather than risk a
-    corrupted reuse next turn."""
+def _copy_cache(src):
+    """Independent copy of a prompt cache via the .state/.meta_state API —
+    the same mechanism mlx_lm's save/load_prompt_cache uses, so it works for
+    KVCache and recurrent ArraysCache entries alike. Evaluated immediately so
+    the copy owns materialized data before the source mutates further."""
+    dst = make_prompt_cache(model)
+    for s, d in zip(src, dst):
+        try:
+            d.state = s.state
+        except Exception:
+            pass  # empty cache entries have no state to copy yet
+        try:
+            d.meta_state = s.meta_state
+        except Exception:
+            pass
+    arrs = _state_arrays(dst)
+    if arrs:
+        mx.eval(arrs)
+    return dst
+
+
+def _clear_metal_cache():
     try:
-        n_cached = int(slot.cache[0].offset)
-        full = prompt_tokens + gen_ids
-        if 0 <= n_cached <= len(full):
-            slot.tokens = full[:n_cached]
-            if CACHE_DEBUG:
-                print(f"[qwen-server] slot={slot.idx} cache holds {n_cached}t")
-        else:
-            print(f"[qwen-server] WARNING slot={slot.idx}: cache offset "
-                  f"{n_cached} > tracked {len(full)} — resetting, reuse lost")
-            slot.reset()
-    except Exception as e:
-        print(f"[qwen-server] WARNING slot={slot.idx}: ledger sync failed "
-              f"({e!r}) — resetting, reuse lost")
-        slot.reset()
+        mx.clear_cache()
+    except Exception:
+        try:
+            mx.metal.clear_cache()
+        except Exception:
+            pass
+
+
+def _prefill(cache, toks: List[int]):
+    """Feed tokens into the cache in chunks, no sampling. This is the manual
+    equivalent of generate_step's prefill loop; we need it standalone so the
+    snapshot can be taken at an exact point BEFORE generation begins."""
+    i = 0
+    while i < len(toks):
+        chunk = mx.array(toks[i:i + PREFILL_STEP])[None]
+        model(chunk, cache=cache)
+        arrs = _state_arrays(cache)
+        if arrs:
+            mx.eval(arrs)
+        _clear_metal_cache()
+        i += PREFILL_STEP
     slot.last_used = time.time()
 
 
@@ -581,12 +623,17 @@ def run_mlx(prompt: str, body: Dict[str, Any]):
                      or DEFAULT_MAX_TOKENS)
 
     tokens: List[int] = tok.encode(prompt)
-    slot, k = _acquire_slot(tokens)
-    suffix, k = _prepare_slot(slot, tokens, k)
     n_prompt = len(tokens)
-    pct = (100 * k // n_prompt) if n_prompt else 0
+    slot, start = _acquire_slot(tokens)
+    if start == 0 and slot.tokens:
+        slot.reset()   # stale snapshot that didn't match: start cold
+
+    # Snapshot point: everything except the volatile tail (generation prompt
+    # / "<think>" opener), so next turn's re-render still extends it cleanly.
+    snap_to = min(max(start, n_prompt - SNAPSHOT_HOLDBACK), n_prompt - 1)
+    pct = (100 * start // n_prompt) if n_prompt else 0
     print(f"[qwen-server] slot={slot.idx} prompt={n_prompt}t "
-          f"kv-reuse={k}t ({pct}%) prefill={len(suffix)}t")
+          f"kv-reuse={start}t ({pct}%) prefill={n_prompt - start}t")
 
     sampler = make_sampler(temp=temp, top_p=top_p, min_p=min_p, top_k=top_k)
     processors = make_logits_processors(
@@ -597,32 +644,39 @@ def run_mlx(prompt: str, body: Dict[str, Any]):
         processors.append(_presence_processor(presence))
 
     t0 = time.perf_counter()
+    if snap_to > start:
+        _prefill(slot.cache, tokens[start:snap_to])
+        slot.tokens = tokens[:snap_to]
+    t1 = time.perf_counter()
+    slot.last_used = time.time()
+    # Generation runs on a COPY; the slot keeps the clean prompt-only state.
+    work = _copy_cache(slot.cache)
+    if CACHE_DEBUG:
+        n_new = snap_to - start
+        rate = (n_new / (t1 - t0)) if (n_new and t1 > t0) else 0
+        print(f"[qwen-server] slot={slot.idx} snapshot={len(slot.tokens)}t"
+              + (f" prefill {n_new}t @ ~{rate:.0f} t/s" if n_new else "")
+              + f", copy {time.perf_counter() - t1:.2f}s")
+    suffix = tokens[snap_to:]
+
     t_first = None
     n_out = 0
-    gen_ids: List[int] = []
-    try:
-        for resp in stream_generate(
-            model, tok, prompt=suffix,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            logits_processors=processors,
-            prompt_cache=slot.cache,
-            prefill_step_size=PREFILL_STEP,
-        ):
-            gen_ids.append(resp.token)
-            piece = resp.text
-            if piece:
-                if t_first is None:
-                    t_first = time.perf_counter()
-                    dt = t_first - t0
-                    tps = getattr(resp, "prompt_tps", 0) or 0
-                    print(f"[qwen-server] TTFT={dt:.2f}s"
-                          + (f" (prefill ~{tps:.0f} t/s)" if tps else ""))
-                n_out += 1
-                yield piece
-    finally:
-        # Always resync the ledger from the cache's real state, even on error.
-        _sync_slot(slot, tokens, gen_ids)
+    for resp in stream_generate(
+        model, tok, prompt=suffix,
+        max_tokens=max_tokens,
+        sampler=sampler,
+        logits_processors=processors,
+        prompt_cache=work,
+        prefill_step_size=PREFILL_STEP,
+    ):
+        piece = resp.text
+        if piece:
+            if t_first is None:
+                t_first = time.perf_counter()
+                dt = t_first - t0
+                print(f"[qwen-server] TTFT={dt:.2f}s")
+            n_out += 1
+            yield piece
 
     t_end = time.perf_counter()
     if t_first is not None and n_out > 1 and t_end > t_first:
