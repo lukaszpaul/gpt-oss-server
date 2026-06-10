@@ -25,11 +25,11 @@ PERF NOTES (this revision — tuned for Copilot's ~30k-token agent prompts)
      (flash_attn is on, which q8 KV requires) — ~half the KV memory at 64k ctx,
      near-lossless, less memory pressure on a 64GB box.
 
-  3. Decode: prompt-lookup speculative decoding now defaults ON (coding/agent
-     output echoes the prompt heavily — file contents, identifiers — so the
-     n-gram draft hits a lot). QWEN_PROMPT_LOOKUP=0 to disable if it ever
-     regresses. QWEN_THINKING=0 disables <think> globally for max agent speed
+  3. Decode: QWEN_THINKING=0 disables <think> globally for max agent speed
      (plan-mode quality tradeoff; per-request reasoning_effort still wins).
+     Prompt-lookup speculative decoding (QWEN_PROMPT_LOOKUP=1) is OFF by
+     default: llama-cpp-python's draft-model path needs logits_all=True,
+     which is memory-prohibitive at long context — see the config comment.
 
   Optional: QWEN_RAM_CACHE=1 enables LlamaRAMCache so two *interleaved*
   conversations (e.g. Copilot firing a side request mid-agent-loop) don't
@@ -123,10 +123,15 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("QWEN_MAX_TOKENS", "4096"))
 KV_TYPE_K = int(os.environ.get("QWEN_KV_TYPE_K", "8"))
 KV_TYPE_V = int(os.environ.get("QWEN_KV_TYPE_V", "8"))
 
-# Prompt-lookup speculative decoding — ON by default. Coding/agent output
-# echoes the input (file contents, identifiers) heavily, so the n-gram draft
-# model hits often and decode speeds up for free. QWEN_PROMPT_LOOKUP=0 to off.
-USE_PROMPT_LOOKUP = os.environ.get("QWEN_PROMPT_LOOKUP", "1") == "1"
+# Prompt-lookup speculative decoding — OFF by default. In llama-cpp-python,
+# attaching a draft_model makes generate() request logits for EVERY token in
+# the batch and write them into Llama.scores, which is only allocated with
+# logits_all=True; without it you get
+#   ValueError: could not broadcast input array from shape (N,) into shape (0,)
+# on the first decode (N = n_ubatch * n_vocab). And logits_all=True needs
+# n_ctx * n_vocab * 4 bytes (~60GB at 64k ctx) — prohibitive. Leave this off
+# unless you're on a small context and know your build handles it.
+USE_PROMPT_LOOKUP = os.environ.get("QWEN_PROMPT_LOOKUP", "0") == "1"
 PROMPT_LOOKUP_TOKENS = int(os.environ.get("QWEN_PROMPT_LOOKUP_TOKENS", "10"))
 
 # Global thinking kill-switch. QWEN_THINKING=0 renders the template with
