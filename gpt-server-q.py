@@ -5,6 +5,37 @@ Apple Silicon via llama-cpp-python, built so GitHub Copilot's Custom Endpoint
 treats it like a native model: tool calling, agent/plan mode, clean formatting
 (reasoning never leaks into the answer).
 
+PERF NOTES (this revision — tuned for Copilot's ~30k-token agent prompts)
+  The dominant cost is PREFILL of the huge Copilot prompt, not decode. Three
+  levers, in order of impact:
+
+  1. KV-prefix reuse (free, already structural). Everything runs on ONE Llama
+     instance on ONE worker thread, so llama.cpp automatically diffs each new
+     prompt against the tokens already in the KV cache and only prefills the
+     new tail. Agent loops replay the same prefix + new turns, so after the
+     first (slow) request, each turn should prefill only the delta.
+     -> run_text() now LOGS "kv-reuse" per request. If you see reuse ~0% on
+        agent turns, Copilot is injecting changing content (timestamps, open
+        editor context) near the TOP of the prompt and killing the cache —
+        that's the thing to hunt, not sampling knobs.
+
+  2. Prefill throughput: n_batch AND n_ubatch raised to 2048 (n_ubatch is the
+     one that actually gates Metal prefill chunking; llama-cpp-python defaults
+     it to 512 regardless of n_batch). KV cache defaults to q8_0 now
+     (flash_attn is on, which q8 KV requires) — ~half the KV memory at 64k ctx,
+     near-lossless, less memory pressure on a 64GB box.
+
+  3. Decode: prompt-lookup speculative decoding now defaults ON (coding/agent
+     output echoes the prompt heavily — file contents, identifiers — so the
+     n-gram draft hits a lot). QWEN_PROMPT_LOOKUP=0 to disable if it ever
+     regresses. QWEN_THINKING=0 disables <think> globally for max agent speed
+     (plan-mode quality tradeoff; per-request reasoning_effort still wins).
+
+  Optional: QWEN_RAM_CACHE=1 enables LlamaRAMCache so two *interleaved*
+  conversations (e.g. Copilot firing a side request mid-agent-loop) don't
+  evict each other's prefix. Off by default: it snapshots full KV state per
+  entry, which is GB-scale at long context — watch memory if you turn it on.
+
 WHAT CHANGED vs the first draft (and WHY agent mode was failing)
   Qwen3.6-35B-A3B was trained on the Qwen3-CODER tool-call format, which is
   nested XML, NOT Hermes JSON:
@@ -31,8 +62,6 @@ WHAT CHANGED vs the first draft (and WHY agent mode was failing)
    - Unclosed tool calls (cut off by max_tokens / EOS) are still finalized
      instead of being silently dropped.
    - presence_penalty default (Qwen3.6's recommended anti-loop knob).
-   - Optional KV-cache quantization, larger prefill batch, and optional
-     prompt-lookup speculative decoding (big win for coding/agent echo).
    - preserve_thinking chat_template_kwarg on by default (helps agent turns).
 
 WHY THIS FILE (vs the MLX one): MLX can't read a GGUF k-quant, so to use the
@@ -62,6 +91,7 @@ import queue
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 from llama_cpp import Llama
 from transformers import AutoTokenizer
 
@@ -78,19 +108,43 @@ MODEL_ID = os.environ.get("QWEN_ID", "qwen3.6-35b-a3b")
 PORT = int(os.environ.get("QWEN_PORT", "8000"))
 N_CTX = int(os.environ.get("QWEN_CTX", "65536"))         # model is 262K-native; raise if RAM allows
 N_GPU_LAYERS = int(os.environ.get("QWEN_NGL", "-1"))     # -1 = offload all to Metal
-N_BATCH = int(os.environ.get("QWEN_N_BATCH", "1024"))    # bigger prefill batch = faster on long agent prompts
+
+# Prefill batching. n_ubatch is the micro-batch llama.cpp actually pushes
+# through Metal per step; llama-cpp-python defaults it to 512 even when
+# n_batch is larger, so set BOTH. 2048 is a good M4 Max starting point.
+N_BATCH = int(os.environ.get("QWEN_N_BATCH", "2048"))
+N_UBATCH = int(os.environ.get("QWEN_N_UBATCH", str(N_BATCH)))
 N_THREADS = os.environ.get("QWEN_N_THREADS")             # set to P-core count (M4 Max: ~12); None = auto
 DEFAULT_MAX_TOKENS = int(os.environ.get("QWEN_MAX_TOKENS", "4096"))
 
-# KV-cache quantization (more context headroom). 0=f16 (default), 8=q8_0, 2=q4_0.
-# q8_0 nearly free quality-wise and roughly halves KV memory; requires flash_attn.
-KV_TYPE_K = int(os.environ.get("QWEN_KV_TYPE_K", "0"))
-KV_TYPE_V = int(os.environ.get("QWEN_KV_TYPE_V", "0"))
+# KV-cache quantization. 0=f16, 8=q8_0, 2=q4_0. Default is now q8_0: nearly
+# free quality-wise, roughly halves KV memory at 64k ctx (requires flash_attn,
+# which is on). Set QWEN_KV_TYPE_K=0 QWEN_KV_TYPE_V=0 to go back to f16.
+KV_TYPE_K = int(os.environ.get("QWEN_KV_TYPE_K", "8"))
+KV_TYPE_V = int(os.environ.get("QWEN_KV_TYPE_V", "8"))
 
-# Optional prompt-lookup speculative decoding. Coding/agent output echoes the
-# input (file contents, identifiers) heavily, so this can be a real speedup.
-USE_PROMPT_LOOKUP = os.environ.get("QWEN_PROMPT_LOOKUP", "0") == "1"
+# Prompt-lookup speculative decoding — ON by default. Coding/agent output
+# echoes the input (file contents, identifiers) heavily, so the n-gram draft
+# model hits often and decode speeds up for free. QWEN_PROMPT_LOOKUP=0 to off.
+USE_PROMPT_LOOKUP = os.environ.get("QWEN_PROMPT_LOOKUP", "1") == "1"
 PROMPT_LOOKUP_TOKENS = int(os.environ.get("QWEN_PROMPT_LOOKUP_TOKENS", "10"))
+
+# Global thinking kill-switch. QWEN_THINKING=0 renders the template with
+# enable_thinking=False on every request — big latency win in agent loops at
+# some planning-quality cost. Per-request enable_thinking/reasoning_effort
+# from the client still take precedence.
+THINKING_DEFAULT = os.environ.get("QWEN_THINKING", "1") == "1"
+
+# Optional cross-conversation prefix cache (see header). Off by default.
+USE_RAM_CACHE = os.environ.get("QWEN_RAM_CACHE", "0") == "1"
+RAM_CACHE_GB = float(os.environ.get("QWEN_RAM_CACHE_GB", "16"))
+
+# Per-request chat logging for visibility: writes one JSON per request into
+# ./chats (relative to wherever you launch the server), containing the raw
+# OpenAI messages, the EXACT rendered prompt string fed to llama.cpp, and the
+# full response (reasoning / content / tool calls). Toggle: QWEN_CHAT_LOG=0.
+CHAT_LOG = os.environ.get("QWEN_CHAT_LOG", "1") == "1"
+CHAT_LOG_DIR = os.environ.get("QWEN_CHAT_LOG_DIR", os.path.join(os.getcwd(), "chats"))
 
 # Qwen3.6 thinking-mode sampling. Coding-leaning defaults; presence_penalty is
 # the recommended anti-loop knob (Qwen3.6 suggests up to ~1.5 in thinking mode).
@@ -105,15 +159,18 @@ DEF_FREQUENCY = float(os.environ.get("QWEN_FREQUENCY_PENALTY", "0.0"))
 # llama-cpp-python's Llama object is not safe for concurrent calls, and a stream
 # generator must be drained on the thread that created it. Pin all model work to
 # one worker; this also serializes overlapping requests AND lets llama.cpp reuse
-# the shared KV prefix across agent turns (free prefix caching).
+# the shared KV prefix across agent turns (free prefix caching). NOTE: that
+# automatic reuse is "previous request only" — if two conversations interleave,
+# they evict each other. QWEN_RAM_CACHE=1 papers over that at a memory cost.
 GPU = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llama")
 
 
 def _load():
-    print(f"[qwen-server] loading GGUF {GGUF_PATH} (n_ctx={N_CTX}, ngl={N_GPU_LAYERS}) ...")
+    print(f"[qwen-server] loading GGUF {GGUF_PATH} (n_ctx={N_CTX}, ngl={N_GPU_LAYERS}, "
+          f"n_batch={N_BATCH}, n_ubatch={N_UBATCH}, kv={KV_TYPE_K}/{KV_TYPE_V}) ...")
     kw: Dict[str, Any] = dict(
         model_path=GGUF_PATH, n_ctx=N_CTX, n_gpu_layers=N_GPU_LAYERS,
-        n_batch=N_BATCH, flash_attn=True, verbose=False,
+        n_batch=N_BATCH, n_ubatch=N_UBATCH, flash_attn=True, verbose=False,
     )
     if N_THREADS:
         kw["n_threads"] = int(N_THREADS)
@@ -128,7 +185,15 @@ def _load():
             print(f"[qwen-server] prompt-lookup decoding on (n={PROMPT_LOOKUP_TOKENS})")
         except Exception as e:
             print(f"[qwen-server] prompt-lookup unavailable, continuing without: {e!r}")
-    return Llama(**kw)
+    model = Llama(**kw)
+    if USE_RAM_CACHE:
+        try:
+            from llama_cpp import LlamaRAMCache
+            model.set_cache(LlamaRAMCache(capacity_bytes=int(RAM_CACHE_GB * (1 << 30))))
+            print(f"[qwen-server] RAM prefix cache on ({RAM_CACHE_GB:g} GB) — watch memory")
+        except Exception as e:
+            print(f"[qwen-server] RAM cache unavailable, continuing without: {e!r}")
+    return model
 
 
 llm = GPU.submit(_load).result()
@@ -202,7 +267,13 @@ def build_prompt(body: Dict[str, Any]) -> str:
 
     enable_thinking = body.get("enable_thinking")
     if enable_thinking is None:
-        enable_thinking = str(body.get("reasoning_effort", "")).lower() != "none"
+        effort = str(body.get("reasoning_effort", "")).lower()
+        if effort == "none":
+            enable_thinking = False
+        elif effort in ("low", "medium", "high"):
+            enable_thinking = True
+        else:
+            enable_thinking = THINKING_DEFAULT
 
     # preserve_thinking helps Qwen3.6 in multi-turn agent loops; let the client
     # override via chat_template_kwargs.
@@ -404,8 +475,27 @@ class QwenStreamParser:
 
 
 # --------------------------------------------------------------------------- #
-# Inference: stream text deltas out of llama.cpp
+# Inference: stream text deltas out of llama.cpp (+ perf instrumentation)
 # --------------------------------------------------------------------------- #
+def _prefix_reuse_stats(prompt: str) -> Tuple[int, int]:
+    """(n_prompt_tokens, n_reused_from_kv). Mirrors the comparison llama.cpp
+    does internally so we can SEE whether Copilot's prompt is cache-friendly.
+    Best-effort: any failure just disables the metric."""
+    try:
+        toks = llm.tokenize(prompt.encode("utf-8"), add_bos=False, special=True)
+        n_prompt = len(toks)
+        prev = np.asarray(llm._input_ids[: llm.n_tokens]) if llm.n_tokens else np.empty(0, dtype=np.int64)
+        n = min(len(prev), n_prompt)
+        if n == 0:
+            return n_prompt, 0
+        cur = np.asarray(toks[:n])
+        mismatch = np.nonzero(prev[:n] != cur)[0]
+        reused = int(mismatch[0]) if mismatch.size else n
+        return n_prompt, reused
+    except Exception:
+        return -1, 0
+
+
 def run_text(prompt: str, body: Dict[str, Any]):
     """Yield generated text deltas (worker thread only)."""
     def pick(key, default, cast):
@@ -422,6 +512,15 @@ def run_text(prompt: str, body: Dict[str, Any]):
     max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens")
                      or DEFAULT_MAX_TOKENS)
 
+    n_prompt, reused = _prefix_reuse_stats(prompt)
+    to_prefill = (n_prompt - reused) if n_prompt >= 0 else -1
+    if n_prompt >= 0:
+        pct = (100 * reused // n_prompt) if n_prompt else 0
+        print(f"[qwen-server] prompt={n_prompt}t kv-reuse={reused}t ({pct}%) prefill~{to_prefill}t")
+
+    t0 = time.perf_counter()
+    t_first = None
+    n_out = 0
     for out in llm.create_completion(
         prompt, max_tokens=max_tokens, temperature=temp, top_p=top_p,
         top_k=top_k, min_p=min_p, repeat_penalty=repeat,
@@ -430,7 +529,62 @@ def run_text(prompt: str, body: Dict[str, Any]):
     ):
         piece = out["choices"][0].get("text", "")
         if piece:
+            if t_first is None:
+                t_first = time.perf_counter()
+                dt = t_first - t0
+                rate = (to_prefill / dt) if (to_prefill > 0 and dt > 0) else 0
+                print(f"[qwen-server] TTFT={dt:.2f}s"
+                      + (f" (~{rate:.0f} t/s prefill)" if rate else ""))
+            n_out += 1
             yield piece
+    t_end = time.perf_counter()
+    if t_first is not None and n_out > 1 and t_end > t_first:
+        print(f"[qwen-server] decode: {n_out} chunks in {t_end - t_first:.2f}s "
+              f"(~{n_out / (t_end - t_first):.1f} t/s)")
+
+
+# --------------------------------------------------------------------------- #
+# Chat logging (visibility): one JSON per request in ./chats
+# --------------------------------------------------------------------------- #
+def _log_chat(cid: str, created: int, body: Dict[str, Any], prompt: str,
+              reasoning: str, content: str, tool_calls: List[Dict[str, Any]],
+              stream: bool, duration_s: float):
+    """Dump everything the model saw and everything it produced for one
+    request. 'rendered_prompt' is the literal string handed to llama.cpp
+    (post chat-template), i.e. exactly what the model sees. Best-effort:
+    logging failures never break a request."""
+    if not CHAT_LOG:
+        return
+    try:
+        os.makedirs(CHAT_LOG_DIR, exist_ok=True)
+        record = {
+            "id": cid,
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(created)),
+            "duration_s": round(duration_s, 2),
+            "stream": stream,
+            "model": MODEL_ID,
+            "params": {k: body.get(k) for k in (
+                "temperature", "top_p", "top_k", "min_p", "max_tokens",
+                "max_completion_tokens", "presence_penalty", "frequency_penalty",
+                "repetition_penalty", "reasoning_effort", "enable_thinking",
+            ) if body.get(k) is not None},
+            "tools": [(t.get("function", t) or {}).get("name")
+                      for t in (body.get("tools") or [])],
+            "messages": body.get("messages"),
+            "rendered_prompt": prompt,
+            "response": {
+                "reasoning_content": reasoning or None,
+                "content": content or None,
+                "tool_calls": tool_calls or None,
+            },
+        }
+        fname = f"{time.strftime('%Y%m%d-%H%M%S', time.localtime(created))}-{cid[-8:]}.json"
+        path = os.path.join(CHAT_LOG_DIR, fname)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+        print(f"[qwen-server] chat log -> {path}")
+    except Exception as e:
+        print(f"[qwen-server] chat log failed: {e!r}")
 
 
 # --------------------------------------------------------------------------- #
@@ -448,6 +602,7 @@ async def chat_completions(request: Request):
     stream = bool(body.get("stream", False))
     tools = body.get("tools") or None
     created = int(time.time())
+    t_req = time.perf_counter()
     cid = "chatcmpl-" + uuid.uuid4().hex
 
     prompt = build_prompt(body)
@@ -472,6 +627,8 @@ async def chat_completions(request: Request):
             return reasoning, content, tool_calls
 
         reasoning, content, tool_calls = await asyncio.wrap_future(GPU.submit(generate_all))
+        _log_chat(cid, created, body, prompt, reasoning, content, tool_calls,
+                  stream=False, duration_s=time.perf_counter() - t_req)
         message: Dict[str, Any] = {"role": "assistant",
                                    "content": content if content else None}
         if reasoning.strip():
@@ -491,6 +648,7 @@ async def chat_completions(request: Request):
     def sse():
         parser = QwenStreamParser(initial_mode=init_mode, tools=tools)
         q: "queue.Queue" = queue.Queue(maxsize=256)
+        acc_reasoning, acc_content = [], []   # accumulated for the chat log
 
         def produce():
             try:
@@ -522,11 +680,13 @@ async def chat_completions(request: Request):
                 errored = True
                 break
             for ev_kind, txt in parser.feed(val):
+                (acc_reasoning if ev_kind == "reasoning" else acc_content).append(txt)
                 yield chunk({"reasoning_content": txt} if ev_kind == "reasoning"
                             else {"content": txt})
 
         tail, tool_calls = parser.finish()
         for ev_kind, txt in tail:
+            (acc_reasoning if ev_kind == "reasoning" else acc_content).append(txt)
             yield chunk({"reasoning_content": txt} if ev_kind == "reasoning"
                         else {"content": txt})
 
@@ -538,6 +698,10 @@ async def chat_completions(request: Request):
             yield chunk({}, finish="tool_calls")        # separate terminal chunk
         else:
             yield chunk({}, finish="stop")
+
+        _log_chat(cid, created, body, prompt,
+                  "".join(acc_reasoning), "".join(acc_content), tool_calls,
+                  stream=True, duration_s=time.perf_counter() - t_req)
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(sse(), media_type="text/event-stream")
