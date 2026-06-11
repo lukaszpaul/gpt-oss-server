@@ -32,10 +32,11 @@ WHY MLX (vs the llama-cpp-python version)
      suffix actually prefilled, TTFT, prefill t/s (from MLX itself), and
      decode t/s. If reuse ever drops, you'll see exactly when and how much.
 
-  KV cache is fp16 (hybrid attention keeps KV small — most layers hold a
-  fixed-size recurrent state, only the self_attn layers grow with tokens;
-  ~30k tokens is a few GB per slot, fine on 64GB next to ~17.5GB of OptiQ
-  4-bit weights). Sampling matches the GGUF
+  KV cache is quantized to 8-bit (QWEN_KV_BITS / QWEN_KV_GROUP). Hybrid
+  attention already keeps KV small — most layers hold a fixed-size
+  recurrent state, only the self_attn layers grow with tokens — and 8-bit
+  halves the growing part vs fp16, which matters at 128k context on 64GB
+  next to ~17.5GB of OptiQ 4-bit weights. Sampling matches the GGUF
   server, including an additive OpenAI-style presence penalty implemented as
   a custom logits processor (mlx_lm only ships repetition_penalty natively;
   presence is Qwen3.6's recommended anti-loop knob, so it's reimplemented).
@@ -56,33 +57,6 @@ RUN
     sudo sysctl iogpu.wired_limit_mb=57344
   Optionally also QWEN_WIRED_GB=56 to ask MLX to wire its buffers.
 
-WARM START (skip the ~30k-token Copilot prefill on the first chat)
-  The Copilot system prompt + tool defs are identical across sessions, so
-  their cache state can be built ONCE, saved to disk, and loaded at startup
-  into a pinned slot. Requests matching it fork a COPY into a regular slot,
-  so the clean prefix survives any number of new conversations.
-
-  1. Run the server, do one Copilot chat in two DIFFERENT conversations
-     (so ./chats has two agent-loop logs with different convo content).
-  2. Build (longest common token prefix of the inputs = the stable region):
-       python gpt-server-27b.py --build-warm chats/A.json chats/B.json
-     Sanity check: the printed prefix size should be ~30k tokens. If it is
-     tiny, one of the logs was a side request (title gen) — pick another.
-  3. Restart the server: it logs "warm cache loaded" and the first request
-     prefills only the suffix beyond the cached prefix (TTFT in seconds).
-
-  Storage: QWEN_WARM_CACHE path (default ./warm_cache.safetensors — point
-  it at your models folder if preferred). Hybrid attention keeps the file
-  small (~2GB at 30k tokens: only self_attn layers grow with length).
-  Rebuild whenever Copilot changes its system prompt or tool list — the
-  CACHE_DEBUG divergence log will show exactly when that happens.
-
-  If the divergence log shows a VOLATILE substring inside the system prompt
-  (a date, timestamp, session id), pin it with QWEN_PIN so the rendered
-  prompt is identical across sessions (see PIN_PATTERNS below), then run two
-  fresh chats and rebuild the warm cache from the NEW logs — logs written
-  before pinning contain the unpinned text and won't match.
-
 VS CODE (chatLanguageModels.json): unchanged — point `url` at
   http://localhost:8000/v1/chat/completions , "toolCalling": true, "thinking": true
 """
@@ -101,11 +75,9 @@ import mlx.core as mx
 from mlx_lm import load, stream_generate
 from mlx_lm.sample_utils import make_sampler, make_logits_processors
 from mlx_lm.models.cache import (
+    KVCache,
     make_prompt_cache,
-    trim_prompt_cache,
     can_trim_prompt_cache,
-    save_prompt_cache,
-    load_prompt_cache,
 )
 
 from fastapi import FastAPI, Request
@@ -126,7 +98,7 @@ PREFILL_STEP = int(os.environ.get("QWEN_PREFILL_STEP", "2048"))
 
 # Prompt-cache slots. 3 = agent loop + two side-request streams (Copilot can
 # fire title gen AND summaries between agent turns) without mutual eviction.
-# Each slot holds fp16 KV for its full prompt (~a few GB at 30k tokens).
+# Each slot holds quantized KV for its full prompt.
 CACHE_SLOTS = int(os.environ.get("QWEN_CACHE_SLOTS", "3"))
 # Snapshots exclude the last N prompt tokens. The prompt tail (generation
 # prompt, "<think>" opener) is re-rendered differently next turn, and a
@@ -134,12 +106,12 @@ CACHE_SLOTS = int(os.environ.get("QWEN_CACHE_SLOTS", "3"))
 # tail. Re-prefilling 64 tokens per turn is noise.
 SNAPSHOT_HOLDBACK = int(os.environ.get("QWEN_SNAPSHOT_HOLDBACK", "64"))
 
-# Persistent warm-start cache: a prompt-cache snapshot of the stable Copilot
-# prompt prefix (system prompt + tool defs), built offline via --build-warm
-# and loaded at startup into a pinned slot (see WARM START in the docstring).
-WARM_CACHE = os.environ.get(
-    "QWEN_WARM_CACHE", os.path.join(os.getcwd(), "warm_cache.safetensors")
-)
+# KV cache quantization for the growing self_attn layers (the recurrent
+# linear-attn layers are fixed-size state and unaffected). 8-bit halves KV
+# memory vs fp16 with negligible quality loss; set QWEN_KV_BITS=4 to halve
+# again if 128k contexts still squeeze, or 0 for fp16.
+KV_BITS = int(os.environ.get("QWEN_KV_BITS", "8"))
+KV_GROUP_SIZE = int(os.environ.get("QWEN_KV_GROUP", "64"))
 
 # Cache diagnostics: when a request diverges from its best-matching slot,
 # print WHERE it diverged and the differing text on both sides. This is the
@@ -155,7 +127,7 @@ SORT_TOOLS = os.environ.get("QWEN_SORT_TOOLS", "1") == "1"
 # Prompt pinning: regex substitutions applied to the rendered prompt before
 # tokenization, to neutralize volatile substrings (dates, timestamps, session
 # ids) that Copilot embeds in the system prompt and that otherwise break
-# prefix reuse / the warm cache across sessions. The model SEES the pinned
+# prefix reuse across requests. The model SEES the pinned
 # value, so only pin text whose exact value doesn't matter for coding.
 # Format: JSON list of [pattern, replacement] pairs, e.g.
 #   QWEN_PIN='[["Current date: [^\\n]+", "Current date: 2026-01-01"]]'
@@ -223,14 +195,28 @@ def _load():
 
 
 model, tok = GPU.submit(_load).result()
-_probe = make_prompt_cache(model)
+
+
+def _make_cache():
+    """Fresh prompt cache with the growing self_attn KV layers quantized to
+    KV_BITS. The recurrent linear-attn layers (ArraysCache) are fixed-size
+    state and are left untouched — only KVCache entries grow with tokens."""
+    c = make_prompt_cache(model)
+    if KV_BITS:
+        c = [e.to_quantized(group_size=KV_GROUP_SIZE, bits=KV_BITS)
+             if isinstance(e, KVCache) else e for e in c]
+    return c
+
+
+_probe = _make_cache()
 print(f"[qwen-server] cache layer types: "
       f"{sorted(set(type(c).__name__ for c in _probe))}, "
       f"trimmable={can_trim_prompt_cache(_probe)} -> snapshot caching")
 del _probe
 print(f"[qwen-server] ready. model id: {MODEL_ID} "
       f"(slots={CACHE_SLOTS}, prefill_step={PREFILL_STEP}, "
-      f"holdback={SNAPSHOT_HOLDBACK})")
+      f"holdback={SNAPSHOT_HOLDBACK}, "
+      f"kv={'%d-bit/g%d' % (KV_BITS, KV_GROUP_SIZE) if KV_BITS else 'fp16'})")
 
 app = FastAPI()
 
@@ -249,23 +235,16 @@ class _Slot:
 
     def __init__(self, idx: int):
         self.idx = idx
-        self.cache = make_prompt_cache(model)
+        self.cache = _make_cache()
         self.tokens: List[int] = []   # ledger of tokens the cache contains
         self.last_used = 0.0
 
     def reset(self):
-        self.cache = make_prompt_cache(model)
+        self.cache = _make_cache()
         self.tokens = []
 
 
 _SLOTS: List[_Slot] = []
-
-# Pinned warm-start slot (loaded from WARM_CACHE at startup). NEVER extended
-# in place: a recurrent state can't roll back, so once conversation tokens
-# enter a cache its system-prompt prefix is gone for new chats. Requests that
-# match the warm slot therefore fork a COPY into a regular slot and extend
-# that, leaving the clean prefix available for every future conversation.
-_WARM: Optional[_Slot] = None
 
 
 def _common_prefix(a: List[int], b: List[int]) -> int:
@@ -297,13 +276,10 @@ def _log_divergence(slot: "_Slot", tokens: List[int], k: int):
 def _acquire_slot(tokens: List[int]) -> Tuple[_Slot, int]:
     """Pick the slot whose snapshot is the longest EXACT prefix of the new
     prompt. A partially-matching snapshot is unusable for a recurrent state
-    (no rollback), so it counts as zero. The pinned warm slot competes too,
-    but is never returned directly — it is forked into a regular slot.
-    Worker thread only."""
+    (no rollback), so it counts as zero. Worker thread only."""
     best, best_usable = None, 0
     best_partial, best_partial_k = None, -1
-    cands = _SLOTS + ([_WARM] if _WARM is not None else [])
-    for s in cands:
+    for s in _SLOTS:
         if not s.tokens:
             continue
         k = _common_prefix(s.tokens, tokens)
@@ -312,18 +288,6 @@ def _acquire_slot(tokens: List[int]) -> Tuple[_Slot, int]:
             best, best_usable = s, usable
         if k > best_partial_k:
             best_partial, best_partial_k = s, k
-    if _WARM is not None and best is _WARM:
-        # Fork the pinned snapshot: the new conversation extends the copy,
-        # the warm prefix stays intact for the next new conversation.
-        if len(_SLOTS) < CACHE_SLOTS:
-            s = _Slot(len(_SLOTS))
-            _SLOTS.append(s)
-        else:
-            s = min(_SLOTS, key=lambda x: x.last_used)
-        s.cache = _copy_cache(_WARM.cache)
-        s.tokens = list(_WARM.tokens)
-        print(f"[qwen-server] forked warm cache ({len(s.tokens)}t) -> slot {s.idx}")
-        return s, best_usable
     if best is not None:
         return best, best_usable
     if CACHE_DEBUG and best_partial is not None:
@@ -359,10 +323,11 @@ def _state_arrays(cache_list) -> List["mx.array"]:
 
 def _copy_cache(src):
     """Independent copy of a prompt cache via the .state/.meta_state API —
-    the same mechanism mlx_lm's save/load_prompt_cache uses, so it works for
-    KVCache and recurrent ArraysCache entries alike. Evaluated immediately so
-    the copy owns materialized data before the source mutates further."""
-    dst = make_prompt_cache(model)
+    the same mechanism mlx_lm's cache (de)serialization uses, so it works for
+    (Quantized)KVCache and recurrent ArraysCache entries alike. Evaluated
+    immediately so the copy owns materialized data before the source mutates
+    further."""
+    dst = _make_cache()
     for s, d in zip(src, dst):
         try:
             d.state = s.state
@@ -401,69 +366,6 @@ def _prefill(cache, toks: List[int]):
             mx.eval(arrs)
         _clear_metal_cache()
         i += PREFILL_STEP
-
-
-# --------------------------------------------------------------------------- #
-# Warm-start cache: persist the stable Copilot prompt prefix across restarts
-# --------------------------------------------------------------------------- #
-def _load_warm_cache():
-    """Load the persisted warm-start snapshot into the pinned slot.
-    Worker thread only (materializes mx arrays)."""
-    global _WARM
-    if not os.path.exists(WARM_CACHE):
-        return
-    try:
-        cache, meta = load_prompt_cache(WARM_CACHE, return_metadata=True)
-        if meta.get("model") != MODEL_PATH:
-            print(f"[qwen-server] warm cache ignored: built for "
-                  f"{meta.get('model')!r}, running {MODEL_PATH!r}")
-            return
-        s = _Slot(-1)
-        s.cache = cache
-        s.tokens = json.loads(meta["tokens"])
-        _WARM = s
-        print(f"[qwen-server] warm cache loaded: {len(s.tokens)}t "
-              f"from {WARM_CACHE}")
-    except Exception as e:
-        print(f"[qwen-server] warm cache load failed: {e!r}")
-
-
-def _build_warm_cache(paths: List[str], out_path: str):
-    """One-shot offline build: prefill the stable prompt prefix and save it.
-    Each path is either a ./chats/*.json log (its rendered_prompt is used) or
-    a plain-text prompt file. With 2+ logs from DIFFERENT conversations the
-    longest common token prefix is cached, which automatically excludes
-    per-conversation churn. With a single input the snapshot holdback is
-    subtracted instead. Worker thread only."""
-    texts = []
-    for p in paths:
-        with open(p, "r", encoding="utf-8") as f:
-            raw = f.read()
-        try:
-            texts.append(json.loads(raw)["rendered_prompt"])
-        except Exception:
-            texts.append(raw)
-    token_lists = [tok.encode(t) for t in texts]
-    n = len(token_lists[0])
-    for tl in token_lists[1:]:
-        n = _common_prefix(token_lists[0][:n], tl)
-    if len(token_lists) == 1:
-        n = max(0, n - SNAPSHOT_HOLDBACK)
-    if n <= 0:
-        print("[qwen-server] no common prefix across inputs; nothing to build")
-        return
-    tokens = token_lists[0][:n]
-    print(f"[qwen-server] building warm cache: {n} tokens "
-          f"(common prefix of {len(paths)} input(s))")
-    cache = make_prompt_cache(model)
-    t0 = time.perf_counter()
-    _prefill(cache, tokens)
-    dt = time.perf_counter() - t0
-    print(f"[qwen-server] prefilled {n}t in {dt:.1f}s (~{n / dt:.0f} t/s)")
-    save_prompt_cache(out_path, cache,
-                      {"model": MODEL_PATH, "tokens": json.dumps(tokens)})
-    print(f"[qwen-server] warm cache saved -> {out_path} "
-          f"({os.path.getsize(out_path) / (1 << 30):.2f} GB)")
 
 
 # --------------------------------------------------------------------------- #
@@ -830,6 +732,11 @@ def run_mlx(prompt: str, body: Dict[str, Any]):
     if t_first is not None and n_out > 1 and t_end > t_first:
         print(f"[qwen-server] decode: {n_out} chunks in {t_end - t_first:.2f}s "
               f"(~{n_out / (t_end - t_first):.1f} t/s)")
+    # Drop the working copy and return its buffers to the allocator — at
+    # long contexts this is gigabytes that would otherwise sit in MLX's
+    # buffer pool between requests.
+    del work
+    _clear_metal_cache()
 
 
 # --------------------------------------------------------------------------- #
@@ -993,18 +900,4 @@ async def chat_completions(request: Request):
 
 
 if __name__ == "__main__":
-    import argparse
-
-    ap = argparse.ArgumentParser(
-        description="Qwen3.6-27B MLX server / warm-cache builder")
-    ap.add_argument("--build-warm", nargs="+", metavar="FILE",
-                    help="build the warm-start cache from chat logs "
-                         "(./chats/*.json) or plain-text prompt files, then exit")
-    ap.add_argument("--out", default=WARM_CACHE,
-                    help=f"warm cache output path (default: {WARM_CACHE})")
-    args = ap.parse_args()
-    if args.build_warm:
-        GPU.submit(_build_warm_cache, args.build_warm, args.out).result()
-    else:
-        GPU.submit(_load_warm_cache).result()
-        uvicorn.run(app, host="127.0.0.1", port=PORT)
+    uvicorn.run(app, host="127.0.0.1", port=PORT)
