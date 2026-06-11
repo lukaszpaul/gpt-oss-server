@@ -321,7 +321,7 @@ def _prefill(cache, toks: List[int]):
             mx.eval(arrs)
         _clear_metal_cache()
         i += PREFILL_STEP
-    slot.last_used = time.time()
+    
 
 
 # --------------------------------------------------------------------------- #
