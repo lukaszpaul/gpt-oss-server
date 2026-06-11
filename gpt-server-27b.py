@@ -77,6 +77,12 @@ WARM START (skip the ~30k-token Copilot prefill on the first chat)
   Rebuild whenever Copilot changes its system prompt or tool list — the
   CACHE_DEBUG divergence log will show exactly when that happens.
 
+  If the divergence log shows a VOLATILE substring inside the system prompt
+  (a date, timestamp, session id), pin it with QWEN_PIN so the rendered
+  prompt is identical across sessions (see PIN_PATTERNS below), then run two
+  fresh chats and rebuild the warm cache from the NEW logs — logs written
+  before pinning contain the unpinned text and won't match.
+
 VS CODE (chatLanguageModels.json): unchanged — point `url` at
   http://localhost:8000/v1/chat/completions , "toolCalling": true, "thinking": true
 """
@@ -145,6 +151,24 @@ CACHE_DEBUG = os.environ.get("QWEN_CACHE_DEBUG", "1") == "1"
 # ALL prefix reuse by itself. Sorting by function name makes the rendered
 # prompt deterministic; the model just sees a consistent ordering.
 SORT_TOOLS = os.environ.get("QWEN_SORT_TOOLS", "1") == "1"
+
+# Prompt pinning: regex substitutions applied to the rendered prompt before
+# tokenization, to neutralize volatile substrings (dates, timestamps, session
+# ids) that Copilot embeds in the system prompt and that otherwise break
+# prefix reuse / the warm cache across sessions. The model SEES the pinned
+# value, so only pin text whose exact value doesn't matter for coding.
+# Format: JSON list of [pattern, replacement] pairs, e.g.
+#   QWEN_PIN='[["Current date: [^\\n]+", "Current date: 2026-01-01"]]'
+# Use the CACHE_DEBUG divergence log (cached:/new: lines) to find what to pin.
+PIN_PATTERNS: List[Tuple["re.Pattern", str]] = []
+_pin_raw = os.environ.get("QWEN_PIN", "")
+if _pin_raw:
+    try:
+        for _pat, _repl in json.loads(_pin_raw):
+            PIN_PATTERNS.append((re.compile(_pat), _repl))
+        print(f"[qwen-server] prompt pinning: {len(PIN_PATTERNS)} pattern(s)")
+    except Exception as _e:
+        print(f"[qwen-server] QWEN_PIN parse failed, ignoring: {_e!r}")
 
 # Optional: ask MLX to wire its GPU buffers (resists page eviction between
 # turns). Set to e.g. 56 (GB). Requires the sysctl above to be raised first.
@@ -288,7 +312,7 @@ def _acquire_slot(tokens: List[int]) -> Tuple[_Slot, int]:
             best, best_usable = s, usable
         if k > best_partial_k:
             best_partial, best_partial_k = s, k
-    if best is _WARM:
+    if _WARM is not None and best is _WARM:
         # Fork the pinned snapshot: the new conversation extends the copy,
         # the warm prefix stays intact for the next new conversation.
         if len(_SLOTS) < CACHE_SLOTS:
@@ -536,10 +560,16 @@ def build_prompt(body: Dict[str, Any]) -> str:
         dict(),
     ):
         try:
-            return render(**attempt)
+            return _apply_pins(render(**attempt))
         except TypeError:
             continue
-    return render()
+    return _apply_pins(render())
+
+
+def _apply_pins(prompt: str) -> str:
+    for rx, repl in PIN_PATTERNS:
+        prompt = rx.sub(repl, prompt)
+    return prompt
 
 
 def _starts_in_think(prompt: str) -> bool:
