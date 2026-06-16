@@ -71,6 +71,13 @@ import queue
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    import psutil  # optional; gives current process RSS
+    _PROC = psutil.Process()
+except Exception:
+    psutil = None
+    _PROC = None
+
 import mlx.core as mx
 from mlx_lm import load, stream_generate
 from mlx_lm.sample_utils import make_sampler, make_logits_processors
@@ -117,6 +124,15 @@ KV_GROUP_SIZE = int(os.environ.get("QWEN_KV_GROUP", "64"))
 # print WHERE it diverged and the differing text on both sides. This is the
 # tool for hunting prompt churn (timestamps, shuffled tools, editor state).
 CACHE_DEBUG = os.environ.get("QWEN_CACHE_DEBUG", "1") == "1"
+
+# Memory diagnostics: log MLX allocator stats (active / cache pool / peak) and
+# process RSS at each phase of a request (start, after prefill+copy, after
+# generation). At 128k context on 64GB this is the tool for catching the
+# unified-memory exhaustion that crashes Python: each slot holds a full
+# quantized-KV snapshot AND generation runs on a live COPY of it, so peak
+# transiently doubles the largest slot. Watch "peak" approach the wired/RAM
+# ceiling right before a crash. Set QWEN_MEM_LOG=0 to silence.
+MEM_LOG = os.environ.get("QWEN_MEM_LOG", "1") == "1"
 
 # Copilot is not guaranteed to send the tools array in a stable order, and
 # tools render near the TOP of the Qwen prompt — a shuffled tool list breaks
@@ -217,6 +233,9 @@ print(f"[qwen-server] ready. model id: {MODEL_ID} "
       f"(slots={CACHE_SLOTS}, prefill_step={PREFILL_STEP}, "
       f"holdback={SNAPSHOT_HOLDBACK}, "
       f"kv={'%d-bit/g%d' % (KV_BITS, KV_GROUP_SIZE) if KV_BITS else 'fp16'})")
+if MEM_LOG and psutil is None:
+    print("[qwen-server] mem: psutil not installed; rss is peak-only via "
+          "resource.getrusage (pip install psutil for live rss)")
 
 app = FastAPI()
 
@@ -351,6 +370,57 @@ def _clear_metal_cache():
             mx.metal.clear_cache()
         except Exception:
             pass
+
+
+def _mx_mem(name: str) -> Optional[int]:
+    """Read one MLX allocator counter (bytes) across MLX versions: the getters
+    moved from mx.metal.* to top-level mx.* in newer releases."""
+    for obj in (mx, getattr(mx, "metal", None)):
+        if obj is None:
+            continue
+        fn = getattr(obj, name, None)
+        if fn is not None:
+            try:
+                return int(fn())
+            except Exception:
+                return None
+    return None
+
+
+def _rss_bytes() -> Optional[int]:
+    """Current resident set size of this process, in bytes (unified memory on
+    Apple Silicon, so this includes GPU buffers MLX has wired/allocated)."""
+    if _PROC is not None:
+        try:
+            return int(_PROC.memory_info().rss)
+        except Exception:
+            pass
+    try:
+        import resource  # macOS: ru_maxrss is bytes (peak, not current)
+        return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except Exception:
+        return None
+
+
+def _gb(n: Optional[int]) -> str:
+    return f"{n / (1 << 30):.2f}GB" if n is not None else "n/a"
+
+
+def _log_mem(phase: str, slot_idx: Optional[int] = None):
+    """One memory snapshot line. `active` = live MLX arrays, `cache` = MLX's
+    reusable buffer pool, `peak` = high-water mark since reset, `rss` = whole
+    process. The gap (rss - active - cache) is non-MLX/python overhead."""
+    if not MEM_LOG:
+        return
+    active = _mx_mem("get_active_memory")
+    cache = _mx_mem("get_cache_memory")
+    peak = _mx_mem("get_peak_memory")
+    rss = _rss_bytes()
+    where = f"slot={slot_idx} " if slot_idx is not None else ""
+    print(f"[qwen-server] mem {where}[{phase}] "
+          f"active={_gb(active)} cache={_gb(cache)} "
+          f"peak={_gb(peak)} rss={'~' if _PROC is None else ''}{_gb(rss)} "
+          f"slots={len(_SLOTS)}")
 
 
 def _prefill(cache, toks: List[int]):
@@ -684,6 +754,7 @@ def run_mlx(prompt: str, body: Dict[str, Any]):
     pct = (100 * start // n_prompt) if n_prompt else 0
     print(f"[qwen-server] slot={slot.idx} prompt={n_prompt}t "
           f"kv-reuse={start}t ({pct}%) prefill={n_prompt - start}t")
+    _log_mem("req-start", slot.idx)
 
     sampler = make_sampler(temp=temp, top_p=top_p, min_p=min_p, top_k=top_k)
     processors = make_logits_processors(
@@ -707,6 +778,10 @@ def run_mlx(prompt: str, body: Dict[str, Any]):
         print(f"[qwen-server] slot={slot.idx} snapshot={len(slot.tokens)}t"
               + (f" prefill {n_new}t @ ~{rate:.0f} t/s" if n_new else "")
               + f", copy {time.perf_counter() - t1:.2f}s")
+    # Peak after prefill + the working-copy clone: this is the transient
+    # high-water mark (snapshot KV + its live copy both resident) that most
+    # often tips a 128k context over the 64GB ceiling.
+    _log_mem("after-prefill+copy", slot.idx)
     suffix = tokens[snap_to:]
 
     t_first = None
@@ -737,6 +812,7 @@ def run_mlx(prompt: str, body: Dict[str, Any]):
     # buffer pool between requests.
     del work
     _clear_metal_cache()
+    _log_mem("after-cleanup", slot.idx)
 
 
 # --------------------------------------------------------------------------- #
