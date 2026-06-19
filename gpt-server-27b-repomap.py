@@ -11,6 +11,17 @@ REPO MAP (what's new vs gpt-server-27b.py)
   just to orient itself, and every one of those tool calls is a slow dense
   prefill. We replace exploration with a precomputed map handed to it up front.
 
+  TWO PRODUCTS from one cached per-root index:
+    - STATIC <repoMap>: role-ranked detail (Angular/.NET conventions + PageRank
+      reference centrality) PLUS a collapsed directory breadth summary, injected
+      before <context> -> snapshot-cached stable prefix, paid once per repo.
+    - DYNAMIC <relevantFiles>: deterministic retrieval for the CURRENT question
+      (no model, no swap — microseconds off the prebuilt index), injected before
+      <userRequest> -> volatile tail, small and query-targeted. This is the
+      "agent in the middle" that points the model at the right files turn one.
+  MULTI-ROOT: every workspace folder is indexed (your Angular + .NET repos in
+  one window both get mapped, not just the first).
+
   WHERE FROM (the "where are we prompting from" problem). The server runs in one
   place (e.g. gpt-oss-server) but Copilot queries come from a DIFFERENT VS Code
   window (e.g. Desktop/dev-tools). VS Code embeds the open workspace root in the
@@ -37,7 +48,9 @@ REPO MAP (what's new vs gpt-server-27b.py)
        prefix.
 
   Knobs: QWEN_REPOMAP (on/off), QWEN_REPOMAP_DIR, QWEN_REPOMAP_TTL,
-  QWEN_REPOMAP_MAX_CHARS, QWEN_REPOMAP_MAX_FILES, QWEN_REPOMAP_SYMBOLS,
+  QWEN_REPOMAP_MAX_CHARS (static detail budget), QWEN_REPOMAP_BREADTH[_MAX_CHARS],
+  QWEN_REPOMAP_GRAPH[_BOOST/_MAX_FILES], QWEN_REPOMAP_HINT[_FILES],
+  QWEN_REPOMAP_SYMBOLS, QWEN_REPOMAP_TREE_SITTER, QWEN_REPOMAP_MAX_FILES,
   QWEN_REPOMAP_IGNORE. See the config block below.
 
 ----------------------------------------------------------------------------
@@ -263,39 +276,69 @@ DEF_REPEAT = float(os.environ.get("QWEN_REPEAT_PENALTY", "1.05"))
 DEF_PRESENCE = float(os.environ.get("QWEN_PRESENCE_PENALTY", "1.5"))
 
 # --- Repo map ------------------------------------------------------------- #
-# Master switch. When on, every request whose <workspace_info> names a workspace
-# root that exists on THIS host gets a <repoMap> block injected before <context>
-# (i.e. into the snapshot-cached stable prefix).
+# Master switch. When on, every request gets:
+#   (1) a STATIC <repoMap> (role-ranked detail + collapsed directory breadth)
+#       injected before <context> -> snapshot-cached stable prefix, paid once;
+#   (2) a DYNAMIC <relevantFiles> hint (deterministic retrieval for THIS
+#       question) injected before <userRequest> -> volatile tail, cheap+targeted.
+# Multi-root workspaces are fully handled: every workspace folder is indexed.
 REPOMAP_ENABLED = os.environ.get("QWEN_REPOMAP", "1") == "1"
 
-# Where rendered maps are cached on disk (survives server restarts). One JSON per
+# Where built indexes are cached on disk (survives restarts). One JSON per
 # workspace root, named by a hash of the absolute path.
 REPOMAP_DIR = os.environ.get("QWEN_REPOMAP_DIR", os.path.join(os.getcwd(), "repomaps"))
 
-# How long a built map is trusted before we re-check the repo signature (git
-# HEAD) / rebuild. Within this window we return the cached string WITHOUT even
-# walking the tree, so the injected prefix is byte-stable and the KV snapshot
-# stays valid no matter how many edits you make mid-session. Seconds.
+# How long a built index is trusted before we re-check the repo signature (git
+# HEAD) / rebuild. Within this window we serve from memory WITHOUT walking the
+# tree, so the injected static prefix is byte-stable and the KV snapshot stays
+# valid no matter how many edits you make mid-session. Seconds.
 REPOMAP_TTL = float(os.environ.get("QWEN_REPOMAP_TTL", "300"))
 
-# Hard ceiling on the rendered map size (chars). The map shares the context
-# budget, so cap it: lowest-ranked files are dropped (with an "N more omitted"
-# note) until it fits. ~24k chars ≈ ~6k tokens.
-REPOMAP_MAX_CHARS = int(os.environ.get("QWEN_REPOMAP_MAX_CHARS", "24000"))
+# Char budget for the STATIC detailed section (per root). It's snapshot-cached,
+# so a generous budget is nearly free after turn 1; raise it on big repos.
+REPOMAP_MAX_CHARS = int(os.environ.get("QWEN_REPOMAP_MAX_CHARS", "16000"))
 
-# Stop walking after this many indexable files (protects against a pathological
-# tree). Files past the cap simply aren't in the map.
-REPOMAP_MAX_FILES = int(os.environ.get("QWEN_REPOMAP_MAX_FILES", "4000"))
+# Stop walking after this many indexable files (guards a pathological tree).
+REPOMAP_MAX_FILES = int(os.environ.get("QWEN_REPOMAP_MAX_FILES", "8000"))
 
 # Per-file byte cap for symbol extraction (we only scan the head of each file).
 REPOMAP_MAX_FILE_BYTES = int(os.environ.get("QWEN_REPOMAP_MAX_FILE_BYTES", "200000"))
 
-# Extract top-level symbols (defs/classes/exports/types) per file, not just the
-# tree. Symbols are what make the map actually useful for "where does X live".
+# Extract top-level symbols (classes/services/components/controllers/...) per
+# file. Symbols are what make the map answer "where does X live".
 REPOMAP_SYMBOLS = os.environ.get("QWEN_REPOMAP_SYMBOLS", "1") == "1"
 
 # Max symbols listed per file (keeps fat files from dominating the budget).
 REPOMAP_SYMS_PER_FILE = int(os.environ.get("QWEN_REPOMAP_SYMS_PER_FILE", "12"))
+
+# Collapsed directory breadth summary for the files NOT shown in detail, so the
+# model sees the whole-repo shape (and won't assume code is missing) for cheap.
+REPOMAP_BREADTH = os.environ.get("QWEN_REPOMAP_BREADTH", "1") == "1"
+REPOMAP_BREADTH_MAX_CHARS = int(os.environ.get("QWEN_REPOMAP_BREADTH_MAX_CHARS", "8000"))
+
+# Reference-graph centrality: build a symbol-reference graph (file A mentions a
+# type/class/component defined in file B -> edge) and PageRank it. Central files
+# (imported/used everywhere) get a ranking boost on top of their role weight.
+# Works for BOTH stacks (it keys on symbol names, not import/namespace syntax).
+REPOMAP_GRAPH = os.environ.get("QWEN_REPOMAP_GRAPH", "1") == "1"
+REPOMAP_GRAPH_BOOST = float(os.environ.get("QWEN_REPOMAP_GRAPH_BOOST", "2.0"))
+# Skip the graph above this file count (it gets slow); fall back to role weight.
+REPOMAP_GRAPH_MAX_FILES = int(os.environ.get("QWEN_REPOMAP_GRAPH_MAX_FILES", "6000"))
+# Bytes scanned per file when building reference edges (smaller = faster build).
+REPOMAP_GRAPH_READ_BYTES = int(os.environ.get("QWEN_REPOMAP_GRAPH_READ_BYTES", "65536"))
+
+# Dynamic per-question retrieval hint (the "agent in the middle", but
+# deterministic: no model, no swap, runs in microseconds from the prebuilt
+# index). Picks the files most relevant to THIS request and injects them in the
+# volatile tail. This is what replaces the 100k-token investigation.
+REPOMAP_HINT = os.environ.get("QWEN_REPOMAP_HINT", "1") == "1"
+REPOMAP_HINT_FILES = int(os.environ.get("QWEN_REPOMAP_HINT_FILES", "12"))
+
+# Optional tree-sitter symbol backend (EXPERIMENTAL, default off, regex is the
+# tested default). If enabled and tree_sitter_languages is importable, symbols
+# are extracted from real parse trees; any failure falls back to regex per file.
+#   pip install tree_sitter_languages
+REPOMAP_TREE_SITTER = os.environ.get("QWEN_REPOMAP_TREE_SITTER", "0") == "1"
 
 # Comma-separated extra directory names to ignore, on top of the built-in set.
 REPOMAP_EXTRA_IGNORES = [d.strip() for d in
@@ -417,9 +460,11 @@ if MEM_LOG and psutil is None:
           "resource.getrusage (pip install psutil for live rss)")
 if REPOMAP_ENABLED:
     print(f"[qwen-server] repo map: ON (dir={REPOMAP_DIR}, ttl={REPOMAP_TTL:g}s, "
-          f"max={REPOMAP_MAX_CHARS}c/{REPOMAP_MAX_FILES}f, "
-          f"symbols={'on' if REPOMAP_SYMBOLS else 'off'}) — "
-          f"injects per-workspace map from <workspace_info>")
+          f"static={REPOMAP_MAX_CHARS}c +breadth {REPOMAP_BREADTH_MAX_CHARS}c, "
+          f"graph={'on' if REPOMAP_GRAPH else 'off'}, "
+          f"hint={'on x%d' % REPOMAP_HINT_FILES if REPOMAP_HINT else 'off'}, "
+          f"tree-sitter={'on' if REPOMAP_TREE_SITTER else 'off'}) — "
+          f"multi-root, static map -> cached prefix, hint -> volatile tail")
 else:
     print("[qwen-server] repo map: OFF (set QWEN_REPOMAP=1 to enable)")
 
@@ -714,13 +759,20 @@ def _prefill(cache, toks: List[int]):
 
 
 # --------------------------------------------------------------------------- #
-# Repo map — offline structural overview of the WORKSPACE THE REQUEST CAME FROM
+# Repo map — offline index of the WORKSPACE(S) THE REQUEST CAME FROM
 #
-# Built/looked-up here (filesystem work, no MLX) and injected into the stable
-# prefix in build_prompt. Keyed by the absolute workspace path so it follows
-# whichever VS Code window is asking, not the server's cwd. The rendered string
-# is deterministic for a given tree state, which is what lets the KV snapshot
-# cache reuse the injected prefix across turns.
+# One cached per-root index drives two products:
+#   STATIC  <repoMap>       role-ranked detail + collapsed directory breadth,
+#                           injected before <context> (snapshot-cached prefix,
+#                           paid once per repo).
+#   DYNAMIC <relevantFiles> deterministic retrieval for the CURRENT question,
+#                           injected before <userRequest> (volatile tail, cheap
+#                           and query-targeted) — the "agent in the middle",
+#                           minus the model/swap: it runs in microseconds off the
+#                           prebuilt index.
+# Keyed by absolute workspace path (follows the asking VS Code window, not the
+# server cwd) and validated by git HEAD. Multi-root workspaces index EVERY
+# folder. Rendering is deterministic so the cached static prefix stays stable.
 # --------------------------------------------------------------------------- #
 
 # Directories we never descend into (noise / build output / vendored code).
@@ -729,12 +781,12 @@ _REPOMAP_IGNORE_DIRS = {
     ".pytest_cache", ".ruff_cache", ".venv", "venv", "env", "dist", "build",
     "out", ".next", ".nuxt", ".svelte-kit", "target", "bin", "obj", ".idea",
     ".vscode", "coverage", ".cache", ".turbo", ".gradle", "vendor",
-    ".terraform", "__snapshots__", ".parcel-cache", ".pnpm-store",
+    ".terraform", "__snapshots__", ".parcel-cache", ".pnpm-store", "Debug",
+    "Release", "TestResults", "packages",
 }
 
-# Language-specific top-level symbol patterns. Deliberately lightweight (regex,
-# head-of-file) rather than tree-sitter — good enough to answer "where does X
-# live" and trivial to run over a large tree.
+# Language-specific top-level symbol patterns (regex, head-of-file — the tested
+# default backend; tree-sitter is an optional override, see _ts_symbols).
 _JS_PATS = [
     re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)", re.M),
     re.compile(r"^\s*(?:export\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)", re.M),
@@ -744,6 +796,10 @@ _TS_PATS = _JS_PATS + [
     re.compile(r"^\s*(?:export\s+)?(?:declare\s+)?interface\s+([A-Za-z_$][\w$]*)", re.M),
     re.compile(r"^\s*(?:export\s+)?(?:declare\s+)?type\s+([A-Za-z_$][\w$]*)\s*[=<]", re.M),
     re.compile(r"^\s*(?:export\s+)?(?:const\s+)?enum\s+([A-Za-z_$][\w$]*)", re.M),
+]
+_CS_PATS = [
+    re.compile(r"^\s*(?:\[[^\]]*\]\s*)*(?:(?:public|private|protected|internal|sealed|abstract|static|partial)\s+)*(?:class|interface|struct|enum|record)\s+([A-Za-z_]\w*)", re.M),
+    re.compile(r"^\s*(?:public|protected|internal)\s+(?:static\s+|virtual\s+|override\s+|async\s+)*[\w<>\[\],\.\?]+\s+([A-Za-z_]\w*)\s*\(", re.M),
 ]
 _SYMBOL_PATTERNS: Dict[str, List["re.Pattern"]] = {
     ".py": [re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)", re.M),
@@ -755,36 +811,99 @@ _SYMBOL_PATTERNS: Dict[str, List["re.Pattern"]] = {
     ".rs": [re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)", re.M),
             re.compile(r"^\s*(?:pub\s+)?(?:struct|enum|trait)\s+([A-Za-z_]\w*)", re.M)],
     ".java": [re.compile(r"^\s*(?:public|private|protected)?\s*(?:static\s+)?(?:final\s+)?(?:class|interface|enum)\s+([A-Za-z_]\w*)", re.M)],
-    ".cs": [re.compile(r"^\s*(?:public|private|protected|internal)?\s*(?:static\s+|sealed\s+|abstract\s+|partial\s+)*(?:class|interface|struct|enum|record)\s+([A-Za-z_]\w*)", re.M)],
+    ".cs": _CS_PATS,
     ".rb": [re.compile(r"^\s*(?:class|module)\s+([A-Za-z_]\w*)", re.M),
             re.compile(r"^\s*def\s+([A-Za-z_][\w?!]*)", re.M)],
 }
 
-# Files worth listing in the tree even if we don't extract symbols from them.
+# "Major" (graph-node) symbols: type-like DEFINITIONS only. The reference graph
+# links a file to every file whose major symbol it mentions — that works for
+# both Angular (class/interface) and C# (class/interface/record), keying on
+# names rather than import/namespace syntax.
+_MAJOR_TS = [
+    re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)", re.M),
+    re.compile(r"^\s*(?:export\s+)?(?:declare\s+)?interface\s+([A-Za-z_$][\w$]*)", re.M),
+    re.compile(r"^\s*(?:export\s+)?(?:declare\s+)?type\s+([A-Za-z_$][\w$]*)\s*[=<]", re.M),
+    re.compile(r"^\s*(?:export\s+)?(?:const\s+)?enum\s+([A-Za-z_$][\w$]*)", re.M),
+]
+_MAJOR_PATTERNS: Dict[str, List["re.Pattern"]] = {
+    ".ts": _MAJOR_TS, ".tsx": _MAJOR_TS,
+    ".js": _MAJOR_TS[:1], ".jsx": _MAJOR_TS[:1], ".mjs": _MAJOR_TS[:1], ".cjs": _MAJOR_TS[:1],
+    ".py": [re.compile(r"^\s*class\s+([A-Za-z_]\w*)", re.M)],
+    ".cs": [re.compile(r"^\s*(?:\[[^\]]*\]\s*)*(?:(?:public|private|protected|internal|sealed|abstract|static|partial)\s+)*(?:class|interface|struct|enum|record)\s+([A-Za-z_]\w*)", re.M)],
+    ".go": [re.compile(r"^\s*type\s+([A-Za-z_]\w*)\s+(?:struct|interface)", re.M)],
+    ".rs": [re.compile(r"^\s*(?:pub\s+)?(?:struct|enum|trait)\s+([A-Za-z_]\w*)", re.M)],
+    ".java": [re.compile(r"^\s*(?:public|private|protected)?\s*(?:static\s+)?(?:final\s+)?(?:class|interface|enum)\s+([A-Za-z_]\w*)", re.M)],
+    ".rb": [re.compile(r"^\s*(?:class|module)\s+([A-Za-z_]\w*)", re.M)],
+}
+
+# Stack-specific enrichment (decorators / namespace / endpoints) layered on top
+# of whatever symbol backend ran — this is what makes the map read like the
+# architecture rather than a list of class names.
+_NG_SELECTOR_RE = re.compile(r"@Component\s*\([^)]*?selector\s*:\s*['\"]([^'\"]+)['\"]", re.S)
+_NG_DECORATORS = [
+    ("@Component", re.compile(r"@Component\s*\(")),
+    ("@Injectable", re.compile(r"@Injectable\s*\(")),
+    ("@NgModule", re.compile(r"@NgModule\s*\(")),
+    ("@Directive", re.compile(r"@Directive\s*\(")),
+    ("@Pipe", re.compile(r"@Pipe\s*\(")),
+]
+_CS_NAMESPACE_RE = re.compile(r"^\s*namespace\s+([A-Za-z_][\w.]*)", re.M)
+_CS_HTTP_RE = re.compile(r"\[Http(Get|Post|Put|Delete|Patch)(?:\(\s*['\"]([^'\"]*)['\"])?")
+
+# Files worth listing even when we don't extract symbols from them.
 _REPOMAP_AUX_EXTS = {
     ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".md", ".sql", ".sh",
     ".css", ".scss", ".less", ".html", ".vue", ".svelte", ".proto", ".graphql",
-    ".tf", ".env", ".gradle", ".xml",
+    ".tf", ".env", ".gradle", ".xml", ".csproj", ".sln", ".razor",
 }
 _REPOMAP_SPECIAL_FILES = {
     "Dockerfile", "Makefile", "Procfile", "requirements.txt", "package.json",
     "go.mod", "Cargo.toml", "pom.xml", "build.gradle", "CMakeLists.txt",
+    "angular.json", "nx.json", "tsconfig.json",
 }
 _REPOMAP_INDEX_EXTS = set(_SYMBOL_PATTERNS) | _REPOMAP_AUX_EXTS
 
 _WS_FOLDERS_RE = re.compile(
     r"working in a workspace with the following folders:\s*\n((?:[ \t]*-[ \t]*.+(?:\n|$))+)"
 )
+_USERREQ_RE = re.compile(r"<userRequest>(.*?)</userRequest>", re.S)
+_SUBTOK_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Za-z][a-z0-9]*|[0-9]+")
+_IDENT_RE = re.compile(r"[A-Za-z_]\w+")
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "is", "are",
+    "how", "what", "where", "why", "do", "does", "i", "we", "my", "our", "add",
+    "fix", "change", "update", "make", "need", "want", "please", "can", "with",
+    "this", "that", "it", "use", "using", "when", "get", "set", "new", "file",
+    "code", "function", "class", "method", "should", "would", "could", "into",
+}
 
-# root path -> {"sig": str|None, "text": str, "built_at": float}
+# key (normcased path) -> {"sig", "built_at", "index", "static_text"}
 _REPOMAP_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
-def _extract_workspace_root(messages: List[Dict[str, Any]]) -> Optional[str]:
-    """Pull the FIRST workspace folder out of Copilot's <workspace_info> block.
-    This is the VS Code window's open folder — the thing we map — and is NOT the
-    server's cwd. Returns None for requests with no workspace block (e.g. title
-    generation / summary side-requests), which simply get no map."""
+def _read_head(path: str, n: int = REPOMAP_MAX_FILE_BYTES) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read(n)
+    except Exception:
+        return ""
+
+
+def _subtokens(s: str) -> set:
+    """Split an identifier/path into lowercase sub-words (camelCase, kebab, dots,
+    slashes) so 'AuthService' and 'auth.guard.ts' both match a query for 'auth'."""
+    out = set()
+    for part in re.split(r"[^A-Za-z0-9]+", s):
+        for w in _SUBTOK_RE.findall(part):
+            if len(w) > 1:
+                out.add(w.lower())
+    return out
+
+
+def _workspace_roots(messages: List[Dict[str, Any]]) -> List[str]:
+    """ALL workspace folders from Copilot's <workspace_info> block (multi-root
+    workspaces list several). Empty for side-requests with no workspace block."""
     for m in messages:
         c = m.get("content")
         if not isinstance(c, str) or "following folders" not in c:
@@ -792,18 +911,36 @@ def _extract_workspace_root(messages: List[Dict[str, Any]]) -> Optional[str]:
         mt = _WS_FOLDERS_RE.search(c)
         if not mt:
             continue
+        roots = []
         for line in mt.group(1).splitlines():
             line = line.strip()
             if line.startswith("-"):
-                return line[1:].strip()
-    return None
+                p = line[1:].strip()
+                if p:
+                    roots.append(p)
+        if roots:
+            return roots
+    return []
+
+
+def _extract_question(messages: List[Dict[str, Any]]) -> str:
+    """The user's actual request: prefer the last <userRequest> block, else the
+    last user message text."""
+    for m in reversed(messages):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            mt = _USERREQ_RE.search(m["content"])
+            if mt:
+                return mt.group(1).strip()
+    for m in reversed(messages):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            return m["content"].strip()
+    return ""
 
 
 def _repo_signature(root: str) -> Optional[str]:
-    """Cheap freshness key: the workspace's git HEAD. Changes on commit (so the
-    map refreshes when code lands), stable across plain file saves (so it doesn't
-    churn the cache mid-session). None when not a git repo -> we fall back to the
-    TTL alone."""
+    """Cheap freshness key: the workspace's git HEAD. Changes on commit (map
+    refreshes when code lands), stable across plain saves (no mid-session churn).
+    None when not a git repo -> we fall back to the TTL alone."""
     try:
         r = subprocess.run(
             ["git", "-C", root, "rev-parse", "HEAD"],
@@ -816,37 +953,225 @@ def _repo_signature(root: str) -> Optional[str]:
     return None
 
 
-def _extract_symbols(path: str, ext: str) -> List[str]:
-    pats = _SYMBOL_PATTERNS.get(ext)
-    if not pats:
-        return []
+def _classify(rel: str) -> Tuple[str, float, bool]:
+    """Map a path to (role, weight, detail_eligible) using Angular/.NET naming
+    conventions. Higher weight => more architecturally important. detail_eligible
+    False means it's excluded from the detailed section (too noisy) but still
+    counted in the directory breadth."""
+    name = rel.rsplit("/", 1)[-1]
+    nlow = name.lower()
+    low = rel.lower()
+    ext = os.path.splitext(name)[1].lower()
+
+    # Excluded from detail (still counted in breadth).
+    if nlow.endswith((".spec.ts", ".test.ts")) or ".spec." in nlow or nlow.endswith(("tests.cs", ".test.cs")):
+        return ("test", 0.5, False)
+    if nlow.endswith((".designer.cs", ".g.cs", ".generated.cs", ".g.ts")):
+        return ("generated", 0.2, False)
+    if "/migrations/" in low or low.startswith("migrations/"):
+        return ("migration", 0.4, False)
+    if ext in (".html", ".htm"):
+        return ("template", 1.0, False)
+    if ext in (".scss", ".css", ".less", ".sass"):
+        return ("style", 1.0, False)
+
+    # Angular.
+    if nlow.endswith("-routing.module.ts") or nlow in ("app.routes.ts", "app-routing.module.ts"):
+        return ("ng-routing", 10.0, True)
+    if nlow.endswith(".module.ts"):
+        return ("ng-module", 9.0, True)
+    if nlow.endswith((".service.ts", ".guard.ts", ".interceptor.ts", ".resolver.ts",
+                      ".facade.ts", ".store.ts", ".effects.ts", ".state.ts", ".reducer.ts")):
+        return ("ng-service", 9.0, True)
+    if nlow.endswith(".component.ts"):
+        return ("ng-component", 7.0, True)
+    if nlow.endswith((".directive.ts", ".pipe.ts")):
+        return ("ng-other", 6.0, True)
+    if nlow.endswith((".model.ts", ".dto.ts", ".types.ts", ".interface.ts", ".enum.ts")):
+        return ("ng-model", 5.0, True)
+    if nlow == "index.ts":
+        return ("barrel", 5.0, True)
+
+    # C# / .NET.
+    if nlow in ("program.cs", "startup.cs"):
+        return ("net-entry", 10.0, True)
+    if nlow.endswith("controller.cs"):
+        return ("net-controller", 9.0, True)
+    if nlow.endswith(("service.cs", "repository.cs", "handler.cs", "manager.cs",
+                      "provider.cs", "factory.cs")):
+        return ("net-service", 8.0, True)
+    if name[:1] == "I" and name[1:2].isupper() and ext == ".cs":
+        return ("net-interface", 7.0, True)
+    if nlow.endswith(("dto.cs", "model.cs", "entity.cs", "request.cs", "response.cs",
+                      "dao.cs", "vm.cs", "viewmodel.cs")):
+        return ("net-model", 5.0, True)
+
+    # Build / config / docs.
+    if ext in (".csproj", ".sln") or name in _REPOMAP_SPECIAL_FILES:
+        return ("build", 7.0, True)
+    if ext in _SYMBOL_PATTERNS:
+        return ("code", 4.0, True)
+    if ext == ".md":
+        return ("doc", 2.0, True)
+    return ("other", 2.0, ext in _SYMBOL_PATTERNS)
+
+
+# Optional tree-sitter backend (experimental). Node-type sets are deliberately
+# broad; any failure returns None and we fall back to regex.
+_TS_LANG = {".ts": "typescript", ".tsx": "tsx", ".js": "javascript",
+            ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+            ".py": "python", ".cs": "c_sharp", ".go": "go", ".rs": "rust",
+            ".java": "java", ".rb": "ruby"}
+_TS_DEF_NODES = {"class_declaration", "interface_declaration", "type_alias_declaration",
+                 "enum_declaration", "function_declaration", "method_definition",
+                 "method_declaration", "struct_declaration", "record_declaration",
+                 "function_definition", "class_definition"}
+_TS_MAJOR_NODES = {"class_declaration", "interface_declaration", "type_alias_declaration",
+                   "enum_declaration", "struct_declaration", "record_declaration",
+                   "class_definition"}
+_TS_PARSERS: Dict[str, Any] = {}
+
+
+def _ts_symbols(text: str, ext: str):
+    lang = _TS_LANG.get(ext)
+    if not lang:
+        return None
     try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            text = f.read(REPOMAP_MAX_FILE_BYTES)
+        from tree_sitter_languages import get_parser
+        p = _TS_PARSERS.get(lang)
+        if p is None:
+            p = get_parser(lang)
+            _TS_PARSERS[lang] = p
+        tree = p.parse(text.encode("utf-8", "ignore"))
+        syms: List[str] = []
+        major = set()
+        seen = set()
+        stack = [tree.root_node]
+        while stack:
+            node = stack.pop()
+            if node.type in _TS_DEF_NODES:
+                nm = node.child_by_field_name("name")
+                if nm is not None:
+                    name = nm.text.decode("utf-8", "ignore")
+                    if name and name not in seen:
+                        seen.add(name)
+                        syms.append(name)
+                        if node.type in _TS_MAJOR_NODES:
+                            major.add(name)
+            stack.extend(node.children)
+        return syms, major
     except Exception:
-        return []
-    names: List[str] = []
+        return None
+
+
+def _regex_symbols(text: str, ext: str) -> Tuple[List[str], set]:
+    syms: List[str] = []
     seen = set()
-    for rx in pats:
+    for rx in _SYMBOL_PATTERNS.get(ext, []):
         for m in rx.finditer(text):
             n = m.group(1)
             if n and n not in seen:
                 seen.add(n)
-                names.append(n)
-                if len(names) >= REPOMAP_SYMS_PER_FILE:
-                    return names
-    return names
+                syms.append(n)
+    major = set()
+    for rx in _MAJOR_PATTERNS.get(ext, []):
+        for m in rx.finditer(text):
+            if m.group(1):
+                major.add(m.group(1))
+    return syms, major
 
 
-def _walk_repo(root: str) -> Tuple[List[Tuple[str, List[str]]], bool]:
-    """Walk the tree once. Returns (files, truncated) where files is a list of
-    (relpath_with_forward_slashes, symbols) and truncated is True if we hit
-    REPOMAP_MAX_FILES."""
+def _extract_file_info(path: str, ext: str) -> Tuple[List[str], set]:
+    """(display_symbols, major_names). Symbols are stack-enriched (Angular
+    decorators, C# namespace/endpoints); major_names feed the reference graph."""
+    text = _read_head(path)
+    if not text:
+        return [], set()
+    res = _ts_symbols(text, ext) if REPOMAP_TREE_SITTER else None
+    syms, major = res if res is not None else _regex_symbols(text, ext)
+
+    extra: List[str] = []
+    if ext in (".ts", ".tsx"):
+        sel = _NG_SELECTOR_RE.search(text)
+        for label, rx in _NG_DECORATORS:
+            if rx.search(text):
+                extra.append(f"@Component({sel.group(1)})"
+                             if (label == "@Component" and sel) else label)
+                break
+    elif ext == ".cs":
+        ns = _CS_NAMESPACE_RE.search(text)
+        if ns:
+            extra.append(f"namespace {ns.group(1)}")
+        for verb, route in _CS_HTTP_RE.findall(text)[:6]:
+            extra.append(f"[Http{verb}{(' ' + route) if route else ''}]")
+
+    merged = extra + [s for s in syms if s not in extra]
+    return merged[:REPOMAP_SYMS_PER_FILE], major
+
+
+def _pagerank(edges: Dict[str, Dict[str, int]], d: float = 0.85,
+              iters: int = 20) -> Dict[str, float]:
+    nodes = list(edges)
+    n = len(nodes)
+    if n == 0:
+        return {}
+    pr = {x: 1.0 / n for x in nodes}
+    outsum = {x: sum(t.values()) for x, t in edges.items()}
+    for _ in range(iters):
+        nxt = {x: (1.0 - d) / n for x in nodes}
+        dangling = 0.0
+        for x in nodes:
+            s = outsum[x]
+            if s == 0:
+                dangling += pr[x]
+                continue
+            share = d * pr[x]
+            for tgt, w in edges[x].items():
+                if tgt in nxt:
+                    nxt[tgt] += share * (w / s)
+        if dangling:
+            add = d * dangling / n
+            for x in nodes:
+                nxt[x] += add
+        pr = nxt
+    return pr
+
+
+def _centrality(root: str, files: List[Dict[str, Any]]) -> Dict[str, float]:
+    """PageRank over the symbol-reference graph: file A -> file B when A mentions
+    a major symbol defined in B. Skipped (empty) above REPOMAP_GRAPH_MAX_FILES."""
+    if not REPOMAP_GRAPH or len(files) > REPOMAP_GRAPH_MAX_FILES:
+        return {}
+    defs: Dict[str, set] = {}
+    for f in files:
+        for mname in f["major"]:
+            defs.setdefault(mname, set()).add(f["rel"])
+    names = set(defs)
+    if not names:
+        return {}
+    code_files = [f for f in files if f["ext"] in _SYMBOL_PATTERNS]
+    rels = {f["rel"] for f in code_files}
+    edges: Dict[str, Dict[str, int]] = {f["rel"]: {} for f in code_files}
+    for f in code_files:
+        text = _read_head(os.path.join(root, f["rel"].replace("/", os.sep)),
+                          REPOMAP_GRAPH_READ_BYTES)
+        if not text:
+            continue
+        refs = set(_IDENT_RE.findall(text)) & names
+        tgts = edges[f["rel"]]
+        for nm in refs:
+            for tgt in defs[nm]:
+                if tgt != f["rel"] and tgt in rels:
+                    tgts[tgt] = tgts.get(tgt, 0) + 1
+    return _pagerank(edges)
+
+
+def _build_index(root: str, sig: Optional[str]) -> Dict[str, Any]:
+    """Walk -> classify -> symbols -> centrality -> score. Pure filesystem work."""
     ignore = _REPOMAP_IGNORE_DIRS | set(REPOMAP_EXTRA_IGNORES)
-    files: List[Tuple[str, List[str]]] = []
+    files: List[Dict[str, Any]] = []
     truncated = False
     for dirpath, dirnames, filenames in os.walk(root):
-        # Prune ignored / hidden dirs in place so os.walk doesn't descend them.
         dirnames[:] = [d for d in dirnames
                        if d not in ignore and not d.startswith(".")]
         for fn in filenames:
@@ -855,55 +1180,38 @@ def _walk_repo(root: str) -> Tuple[List[Tuple[str, List[str]]], bool]:
                 continue
             full = os.path.join(dirpath, fn)
             rel = os.path.relpath(full, root).replace(os.sep, "/")
-            syms = (_extract_symbols(full, ext)
-                    if (REPOMAP_SYMBOLS and ext in _SYMBOL_PATTERNS) else [])
-            files.append((rel, syms))
+            role, weight, detail = _classify(rel)
+            syms: List[str] = []
+            major: List[str] = []
+            if REPOMAP_SYMBOLS and detail and ext in _SYMBOL_PATTERNS:
+                s, mj = _extract_file_info(full, ext)
+                syms, major = s, sorted(mj)
+            files.append({"rel": rel, "ext": ext, "role": role, "w": weight,
+                          "detail": detail, "syms": syms, "major": major})
             if len(files) >= REPOMAP_MAX_FILES:
                 truncated = True
-                return files, truncated
-    return files, truncated
-
-
-def _rank_key(item: Tuple[str, List[str]]):
-    """Rank for the char budget: real source before tests/config, shallower
-    before deeper, symbol-rich before symbol-poor. Lower sorts first / survives
-    truncation."""
-    rel, syms = item
-    low = rel.lower()
-    is_test = any(t in low for t in
-                  ("test", "spec", "__mocks__", "fixtures", "mock", "/e2e/"))
-    return (is_test, rel.count("/"), -len(syms), rel)
-
-
-def _render_repo_map(root: str, sig: Optional[str]) -> str:
-    """Walk + rank + budget + render. The output is deterministic for a given
-    tree state (no timestamps, sorted order), so an unchanged repo renders the
-    identical string and the KV snapshot prefix stays valid."""
-    files, truncated = _walk_repo(root)
-    total = len(files)
-
-    # Budget: keep highest-ranked files until we'd blow REPOMAP_MAX_CHARS. We
-    # estimate each file's rendered cost (path tail + symbols) before rendering.
-    ranked = sorted(files, key=_rank_key)
-    kept: List[Tuple[str, List[str]]] = []
-    budget = 0
-    for rel, syms in ranked:
-        cost = len(rel) + sum(len(s) + 2 for s in syms) + 8
-        if budget + cost > REPOMAP_MAX_CHARS and kept:
+                break
+        if truncated:
             break
-        budget += cost
-        kept.append((rel, syms))
-    omitted = total - len(kept)
 
-    # Render the kept files as an indented tree (sorted by path for readability).
+    cen = _centrality(root, files)
+    maxc = max(cen.values()) if cen else 0.0
+    for f in files:
+        c = (cen.get(f["rel"], 0.0) / maxc) if maxc > 0 else 0.0
+        f["c"] = round(c, 4)
+        f["score"] = round(f["w"] * (1.0 + REPOMAP_GRAPH_BOOST * c), 4)
+    return {"root": root, "sig": sig, "files": files, "truncated": truncated,
+            "n_files": len(files)}
+
+
+def _emit_tree(kept: List[Dict[str, Any]]) -> str:
     tree: Dict[str, Any] = {}
-    for rel, syms in sorted(kept):
-        parts = rel.split("/")
+    for f in sorted(kept, key=lambda x: x["rel"]):
+        parts = f["rel"].split("/")
         node = tree
         for p in parts[:-1]:
             node = node.setdefault(p + "/", {})
-        node[parts[-1]] = syms
-
+        node[parts[-1]] = f["syms"][:REPOMAP_SYMS_PER_FILE]
     lines: List[str] = []
 
     def emit(node: Dict[str, Any], depth: int):
@@ -918,123 +1226,242 @@ def _render_repo_map(root: str, sig: Optional[str]) -> str:
                 lines.append(f"{pad}{key}{tail}")
 
     emit(tree, 0)
+    return "\n".join(lines)
 
-    sig_str = sig if sig else "no-git"
-    header = (
-        f"<repoMap>\n"
-        f"Structural map of the workspace at {root} "
-        f"({len(kept)} of {total} files{'+' if truncated else ''} indexed, "
-        f"{sig_str}). Paths are relative to the workspace root; "
-        f"after each file are its top-level symbols. Use this to locate code "
-        f"directly instead of searching, then read/grep only the files you need.\n"
-    )
-    footer = ""
+
+def _render_breadth(files: List[Dict[str, Any]], kept_set: set) -> str:
+    """Per-directory counts (with dominant roles) for files NOT shown in detail,
+    so the model still sees the whole-repo shape cheaply."""
+    dirs: Dict[str, Dict[str, Any]] = {}
+    for f in files:
+        if f["rel"] in kept_set:
+            continue
+        d = (f["rel"].rsplit("/", 1)[0] + "/") if "/" in f["rel"] else "./"
+        agg = dirs.setdefault(d, {"n": 0, "roles": {}})
+        agg["n"] += 1
+        agg["roles"][f["role"]] = agg["roles"].get(f["role"], 0) + 1
+    if not dirs:
+        return ""
+    lines: List[str] = []
+    budget = 0
+    shown = 0
+    for d in sorted(dirs):
+        agg = dirs[d]
+        top = sorted(agg["roles"].items(), key=lambda x: -x[1])[:3]
+        line = f"{d} — {agg['n']} files ({', '.join(f'{r}:{n}' for r, n in top)})"
+        if budget + len(line) + 1 > REPOMAP_BREADTH_MAX_CHARS and lines:
+            break
+        budget += len(line) + 1
+        lines.append(line)
+        shown += 1
+    omitted = len(dirs) - shown
     if omitted > 0:
-        footer = (f"\n... {omitted} lower-priority file(s) omitted to fit budget; "
-                  f"use file_search / grep_search to reach them.")
-    return header + "\n".join(lines) + footer + "\n</repoMap>"
+        lines.append(f"... {omitted} more director{'y' if omitted == 1 else 'ies'} omitted.")
+    return "\n".join(lines)
 
 
-def _get_repo_map(root: str) -> Optional[str]:
-    """Return the cached/rebuilt map text for an absolute workspace root.
-    Cache flow: fresh-within-TTL -> return as-is (no walk); else recheck git
-    signature -> reuse identical text if unchanged, rebuild otherwise. Falls
-    back to disk across restarts. Returns None if the path isn't a real dir on
-    this host (e.g. the server runs on a different machine than VS Code)."""
-    norm = os.path.normpath(root)
-    if not os.path.isdir(norm):
-        return None
-    # Cache key is case-/sep-normalized so the same workspace doesn't fragment
-    # into multiple entries when casing differs (Windows sends "c:\", os.getcwd
-    # gives "C:\"). The map text still DISPLAYS `norm` verbatim, which is stable
-    # per session because Copilot sends one consistent casing.
-    key = os.path.normcase(norm)
-    now = time.time()
+def _render_static(index: Dict[str, Any]) -> str:
+    """STATIC <repoMap>: role-ranked detail (within budget) + collapsed breadth.
+    Deterministic for a given tree state, so the cached prefix stays byte-stable."""
+    root = index["root"]
+    sig = index["sig"] or "no-git"
+    files = index["files"]
+    total = index["n_files"]
 
-    ent = _REPOMAP_CACHE.get(key)
-    if ent and now - ent["built_at"] < REPOMAP_TTL:
-        return ent["text"]                       # fast path: byte-stable, no I/O
+    ranked = sorted((f for f in files if f["detail"]),
+                    key=lambda f: (-f["score"], f["rel"]))
+    kept: List[Dict[str, Any]] = []
+    budget = 0
+    for f in ranked:
+        cost = len(f["rel"]) + sum(len(s) + 2 for s in f["syms"][:REPOMAP_SYMS_PER_FILE]) + 8
+        if budget + cost > REPOMAP_MAX_CHARS and kept:
+            break
+        budget += cost
+        kept.append(f)
+    kept_set = {f["rel"] for f in kept}
 
-    if ent is None:
-        ent = _load_repomap_disk(key)            # survive server restarts
-        if ent:
-            _REPOMAP_CACHE[key] = ent
-
-    sig = _repo_signature(norm)
-    if ent and sig is not None and ent.get("sig") == sig:
-        ent["built_at"] = now                    # unchanged commit: keep text
-        return ent["text"]
-    if ent and sig is None and now - ent["built_at"] < REPOMAP_TTL:
-        return ent["text"]
-
-    text = _render_repo_map(norm, sig)
-    ent = {"sig": sig, "text": text, "built_at": now}
-    _REPOMAP_CACHE[key] = ent
-    _save_repomap_disk(key, ent)
-    print(f"[qwen-server] repo map BUILT for {norm} "
-          f"({len(text)} chars, {sig or 'no-git'})")
-    return text
+    parts = [
+        f'<repoMap root="{root}">',
+        (f"{len(kept)} of {total} files{'+' if index['truncated'] else ''} shown in "
+         f"detail, ranked by role + reference centrality ({sig}). Paths are "
+         f"relative to the root; top-level symbols follow each file. Use this to "
+         f"locate code directly instead of searching."),
+        _emit_tree(kept),
+    ]
+    if REPOMAP_BREADTH:
+        breadth = _render_breadth(files, kept_set)
+        if breadth:
+            parts.append("Directory overview (files not detailed above):")
+            parts.append(breadth)
+    parts.append("</repoMap>")
+    return "\n".join(parts)
 
 
-def _repomap_disk_path(root: str) -> str:
-    h = hashlib.sha256(root.encode("utf-8")).hexdigest()[:16]
+def _retrieve(question: str, indexes: List[Dict[str, Any]], k: int) -> List[Tuple]:
+    """Deterministic retrieval: score every file against the question by sub-token
+    overlap with its symbols (3x) and path (2x), nudged by centrality and role.
+    Returns up to k (score, file, root) tuples, best first."""
+    q = _subtokens(question) - _STOPWORDS
+    if not q:
+        return []
+    scored: List[Tuple] = []
+    for index in indexes:
+        root = index["root"]
+        for f in index["files"]:
+            stok = set()
+            for s in f["syms"]:
+                stok |= _subtokens(s)
+            for mname in f["major"]:
+                stok |= _subtokens(mname)
+            sym_hits = len(q & stok)
+            path_hits = len(q & _subtokens(f["rel"]))
+            if sym_hits == 0 and path_hits == 0:
+                continue
+            sc = 3.0 * sym_hits + 2.0 * path_hits + 0.5 * f.get("c", 0.0) + 0.05 * f["w"]
+            scored.append((sc, f, root))
+    scored.sort(key=lambda x: (-x[0], x[1]["rel"]))
+    return scored[:k]
+
+
+def _render_hint(hits: List[Tuple]) -> str:
+    lines = ["<relevantFiles>",
+             "Files most relevant to this request (deterministic retrieval over "
+             "the repo index — confirm before relying):"]
+    for _sc, f, root in hits:
+        label = os.path.basename(root.rstrip("/\\")) or root
+        syms = ", ".join(f["syms"][:6])
+        lines.append(f"- {label}/{f['rel']}" + (f" — {syms}" if syms else ""))
+    lines.append("</relevantFiles>")
+    return "\n".join(lines)
+
+
+def _repomap_disk_path(key: str) -> str:
+    h = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
     return os.path.join(REPOMAP_DIR, f"{h}.json")
 
 
-def _load_repomap_disk(root: str) -> Optional[Dict[str, Any]]:
-    path = _repomap_disk_path(root)
+def _load_index_disk(key: str) -> Optional[Dict[str, Any]]:
+    path = _repomap_disk_path(key)
     if not os.path.exists(path):
         return None
     try:
         with open(path, encoding="utf-8") as f:
             d = json.load(f)
-        if d.get("root") == root and isinstance(d.get("text"), str):
-            return {"sig": d.get("sig"), "text": d["text"],
-                    "built_at": float(d.get("built_at", 0.0))}
+        if d.get("key") == key and "index" in d and "static_text" in d:
+            return {"sig": d.get("sig"), "built_at": float(d.get("built_at", 0.0)),
+                    "index": d["index"], "static_text": d["static_text"]}
     except Exception:
         pass
     return None
 
 
-def _save_repomap_disk(root: str, ent: Dict[str, Any]):
+def _save_index_disk(key: str, ent: Dict[str, Any]):
     try:
         os.makedirs(REPOMAP_DIR, exist_ok=True)
-        with open(_repomap_disk_path(root), "w", encoding="utf-8") as f:
-            json.dump({"root": root, **ent}, f, ensure_ascii=False)
+        with open(_repomap_disk_path(key), "w", encoding="utf-8") as f:
+            json.dump({"key": key, "sig": ent["sig"], "built_at": ent["built_at"],
+                       "index": ent["index"], "static_text": ent["static_text"]},
+                      f, ensure_ascii=False)
     except Exception as e:
-        print(f"[qwen-server] repo map disk save failed: {e!r}")
+        print(f"[qwen-server] repo index disk save failed: {e!r}")
+
+
+def _get_index(root: str) -> Optional[Dict[str, Any]]:
+    """Cached per-root index entry {sig, built_at, index, static_text}. Fresh
+    within TTL -> served from memory (no walk). Else recheck git HEAD: reuse if
+    unchanged, rebuild otherwise. Falls back to disk across restarts. None if the
+    path isn't a real dir on this host."""
+    norm = os.path.normpath(root)
+    if not os.path.isdir(norm):
+        return None
+    key = os.path.normcase(norm)
+    now = time.time()
+
+    ent = _REPOMAP_CACHE.get(key)
+    if ent and now - ent["built_at"] < REPOMAP_TTL:
+        return ent
+    if ent is None:
+        ent = _load_index_disk(key)
+        if ent:
+            _REPOMAP_CACHE[key] = ent
+
+    sig = _repo_signature(norm)
+    if ent and sig is not None and ent.get("sig") == sig:
+        ent["built_at"] = now
+        return ent
+    if ent and sig is None and now - ent["built_at"] < REPOMAP_TTL:
+        return ent
+
+    t0 = time.time()
+    index = _build_index(norm, sig)
+    static_text = _render_static(index)
+    ent = {"sig": sig, "built_at": now, "index": index, "static_text": static_text}
+    _REPOMAP_CACHE[key] = ent
+    _save_index_disk(key, ent)
+    print(f"[qwen-server] repo index BUILT for {norm}: {index['n_files']} files, "
+          f"static {len(static_text)}c, {sig or 'no-git'}, {time.time() - t0:.1f}s")
+    return ent
 
 
 def _inject_repo_map(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Append a <repoMap> block to the user message that carries <workspace_info>
-    (which sits before <context>, hence inside the snapshot-cached stable
-    prefix). No-op when disabled, when there's no workspace block, or when the
-    workspace path doesn't resolve on this host. Worker-independent: pure Python,
-    runs in the request handler before tokenization."""
+    """Inject (1) the STATIC map into the <workspace_info> message (cached prefix)
+    and (2) the DYNAMIC retrieval hint before <userRequest> (volatile tail), for
+    EVERY workspace root. Pure Python; runs in the request handler before
+    tokenization. No-op for requests with no workspace block."""
     if not REPOMAP_ENABLED:
         return messages
-    root = _extract_workspace_root(messages)
-    if not root:
-        return messages
-    try:
-        block = _get_repo_map(root)
-    except Exception as e:
-        print(f"[qwen-server] repo map failed for {root!r}: {e!r}")
-        return messages
-    if not block:
+    roots = _workspace_roots(messages)
+    if not roots:
         return messages
 
+    indexes: List[Dict[str, Any]] = []
+    statics: List[str] = []
+    for r in roots:
+        try:
+            ent = _get_index(r)
+        except Exception as e:
+            print(f"[qwen-server] repo index failed for {r!r}: {e!r}")
+            ent = None
+        if ent:
+            indexes.append(ent["index"])
+            statics.append(ent["static_text"])
+    if not statics:
+        return messages
+
+    # (1) STATIC -> append to the <workspace_info> message (before <context>).
+    static_block = "\n".join(statics)
     out: List[Dict[str, Any]] = []
-    injected = False
+    done = False
     for m in messages:
         c = m.get("content")
-        if (not injected and isinstance(c, str) and "following folders" in c):
-            m = {**m, "content": c + "\n" + block}
-            injected = True
+        if not done and isinstance(c, str) and "following folders" in c:
+            m = {**m, "content": c + "\n" + static_block}
+            done = True
         out.append(m)
-    if injected:
-        print(f"[qwen-server] repo map injected for {root} ({len(block)} chars)")
-    return out
+    messages = out
+
+    # (2) DYNAMIC -> insert before the last <userRequest> (after <context>).
+    n_hint = 0
+    if REPOMAP_HINT and indexes:
+        q = _extract_question(messages)
+        hits = _retrieve(q, indexes, REPOMAP_HINT_FILES) if q else []
+        if hits:
+            idx = -1
+            for i, m in enumerate(messages):
+                c = m.get("content")
+                if isinstance(c, str) and "<userRequest>" in c:
+                    idx = i
+            if idx >= 0:
+                hint = _render_hint(hits)
+                c = messages[idx]["content"]
+                messages[idx] = {**messages[idx],
+                                 "content": c.replace("<userRequest>",
+                                                      hint + "\n<userRequest>", 1)}
+                n_hint = len(hits)
+
+    print(f"[qwen-server] repo map: {len(statics)} root(s), static {len(static_block)}c"
+          + (f", hint {n_hint} file(s)" if n_hint else ", no hint"))
+    return messages
 
 
 # --------------------------------------------------------------------------- #
