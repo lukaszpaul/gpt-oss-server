@@ -110,8 +110,18 @@ CACHE_SLOTS = int(os.environ.get("QWEN_CACHE_SLOTS", "3"))
 # Snapshots exclude the last N prompt tokens. The prompt tail (generation
 # prompt, "<think>" opener) is re-rendered differently next turn, and a
 # recurrent state can't roll back, so we simply never cache the volatile
-# tail. Re-prefilling 64 tokens per turn is noise.
+# tail. Used as the FALLBACK when QWEN_SNAPSHOT_MARKER isn't found.
 SNAPSHOT_HOLDBACK = int(os.environ.get("QWEN_SNAPSHOT_HOLDBACK", "64"))
+
+# Structural snapshot boundary. The snapshot is taken right before the LAST
+# occurrence of this marker, so the stable prefix (system prompt + workspace
+# info) is cached while the volatile per-turn tail after it (date, terminals,
+# editor state, the user request, generation prompt) is recomputed fresh every
+# turn. Default "<context>" is VS Code Copilot's per-turn context block. Unlike
+# a fixed token holdback, this auto-fits however long the volatile tail grows —
+# a big terminal dump can't silently push the snapshot into changing content.
+# Empty string disables it and falls back to QWEN_SNAPSHOT_HOLDBACK.
+SNAPSHOT_MARKER = os.environ.get("QWEN_SNAPSHOT_MARKER", "<context>")
 
 # KV cache quantization for the growing self_attn layers (the recurrent
 # linear-attn layers are fixed-size state and unaffected). 8-bit halves KV
@@ -162,6 +172,38 @@ if _pin_raw:
 # turns). Set to e.g. 56 (GB). Requires the sysctl above to be raised first.
 WIRED_GB = float(os.environ.get("QWEN_WIRED_GB", "0"))
 
+# --- Memory governor ------------------------------------------------------- #
+# Soft RAM ceiling for THIS process (GB). The governor keeps resident usage
+# under it by evicting least-recently-used slot snapshots BEFORE prefilling a
+# new request, and (with QWEN_MEM_STRICT on) refusing a prompt that still can't
+# fit once every other slot is gone — a clean 503 instead of an OOM crash. On a
+# 64GB box with ~20GB of background load, 40 leaves room for the OS plus the
+# transient snapshot+copy double that generation needs. 0 = governor off.
+MEM_BUDGET_GB = float(os.environ.get("QWEN_MEM_BUDGET_GB", "0"))
+MEM_BUDGET_BYTES = int(MEM_BUDGET_GB * (1 << 30))
+
+# When a request can't fit under the budget even after evicting every other
+# slot: strict (1) refuses it with a 503; lenient (0) logs a warning and tries
+# anyway. Default strict, since the whole point is a hard cap.
+MEM_STRICT = os.environ.get("QWEN_MEM_STRICT", "1") == "1"
+
+# Cap MLX's reusable buffer pool (GB). MLX retains freed buffers in this pool
+# to avoid re-allocating; left uncapped it behaves like a slow leak — RSS
+# climbs request over request ("worse after a few questions") even though the
+# live arrays didn't grow. Capping it forces freed KV back to the OS. 0 =
+# MLX default. A few GB is plenty of scratch; try 4–8.
+CACHE_LIMIT_GB = float(os.environ.get("QWEN_CACHE_LIMIT_GB", "0"))
+
+# Hard upper bound on prompt length (tokens). A prompt above this is refused
+# with a clean error rather than allowed to OOM the box. 0 = no cap.
+MAX_CONTEXT = int(os.environ.get("QWEN_MAX_CONTEXT", "0"))
+
+# Seed for the self-calibrating KV-bytes-per-token estimate the governor uses
+# to project a request's footprint. It is refined by direct allocator
+# measurement after every prefill, so this only matters for the first request
+# or two; the default is a conservative 8-bit-KV hybrid-attention figure.
+KV_BYTES_PER_TOK = float(os.environ.get("QWEN_KV_BYTES_PER_TOK", "70000"))
+
 # Global thinking kill-switch (same semantics as GGUF server).
 THINKING_DEFAULT = os.environ.get("QWEN_THINKING", "1") == "1"
 
@@ -203,8 +245,53 @@ def _set_wired_limit():
         print(f"[qwen-server] wired limit unavailable: {e!r}")
 
 
+def _set_memory_limits():
+    """Cap MLX's buffer pool (and hint its allocation ceiling) so freed KV
+    returns to the OS instead of inflating this process between requests.
+    Version-tolerant: these setters moved from mx.metal.* to top-level mx.*
+    across MLX releases, so probe both and never let a missing API be fatal."""
+    def _call(name, nbytes) -> bool:
+        for obj in (mx, getattr(mx, "metal", None)):
+            if obj is None:
+                continue
+            fn = getattr(obj, name, None)
+            if fn is None:
+                continue
+            try:
+                fn(nbytes)
+                return True
+            except Exception as e:
+                print(f"[qwen-server] {name}({nbytes}) failed: {e!r}")
+                return False
+        return False
+
+    if CACHE_LIMIT_GB:
+        if _call("set_cache_limit", int(CACHE_LIMIT_GB * (1 << 30))):
+            print(f"[qwen-server] MLX cache pool capped at {CACHE_LIMIT_GB:g} GB")
+        else:
+            print("[qwen-server] set_cache_limit unavailable in this MLX build")
+    if MEM_BUDGET_BYTES:
+        # The budget hint's exact signature varies by version (some take a
+        # relaxed flag); try the known forms, tolerate absence. The real
+        # enforcement is the eviction governor below — this is belt-and-braces.
+        for args in ((MEM_BUDGET_BYTES,), (MEM_BUDGET_BYTES, True)):
+            try:
+                fn = getattr(mx, "set_memory_limit", None)
+                if fn is None:
+                    break
+                fn(*args)
+                print(f"[qwen-server] MLX memory limit hint = {MEM_BUDGET_GB:g} GB")
+                break
+            except TypeError:
+                continue
+            except Exception as e:
+                print(f"[qwen-server] set_memory_limit failed: {e!r}")
+                break
+
+
 def _load():
     _set_wired_limit()
+    _set_memory_limits()
     print(f"[qwen-server] loading MLX model {MODEL_PATH} ...")
     model, tokenizer = load(MODEL_PATH)
     return model, tokenizer
@@ -231,8 +318,17 @@ print(f"[qwen-server] cache layer types: "
 del _probe
 print(f"[qwen-server] ready. model id: {MODEL_ID} "
       f"(slots={CACHE_SLOTS}, prefill_step={PREFILL_STEP}, "
-      f"holdback={SNAPSHOT_HOLDBACK}, "
+      f"snapshot={('marker %r' % SNAPSHOT_MARKER) if SNAPSHOT_MARKER else 'holdback'}"
+      f"+holdback={SNAPSHOT_HOLDBACK}, "
       f"kv={'%d-bit/g%d' % (KV_BITS, KV_GROUP_SIZE) if KV_BITS else 'fp16'})")
+if MEM_BUDGET_BYTES or CACHE_LIMIT_GB or MAX_CONTEXT:
+    print(f"[qwen-server] governor: budget={MEM_BUDGET_GB:g}GB "
+          f"strict={MEM_STRICT} cache_pool_cap="
+          f"{('%gGB' % CACHE_LIMIT_GB) if CACHE_LIMIT_GB else 'off'} "
+          f"max_ctx={MAX_CONTEXT or 'off'} "
+          f"seed~{int(KV_BYTES_PER_TOK)//1000}KB/tok")
+else:
+    print("[qwen-server] governor: OFF (set QWEN_MEM_BUDGET_GB to enable)")
 if MEM_LOG and psutil is None:
     print("[qwen-server] mem: psutil not installed; rss is peak-only via "
           "resource.getrusage (pip install psutil for live rss)")
@@ -423,6 +519,95 @@ def _log_mem(phase: str, slot_idx: Optional[int] = None):
           f"slots={len(_SLOTS)}")
 
 
+# --------------------------------------------------------------------------- #
+# Memory governor — keep resident usage under MEM_BUDGET_BYTES
+#
+# Python can't impose a true OS ceiling on unified memory, so instead we (a)
+# cap MLX's buffer pool at startup (above) so freed KV returns to the OS, and
+# (b) before prefilling each request, PROJECT this request's footprint and
+# evict least-recently-used slot snapshots until it fits — refusing outright
+# if it can't fit even with every other slot gone. The per-token KV cost is
+# measured live and refined after every prefill, so the projection tracks the
+# real model/quantization instead of a guess.
+# --------------------------------------------------------------------------- #
+class MemoryBudgetExceeded(Exception):
+    """Raised when a request cannot be served under MEM_BUDGET_BYTES."""
+
+
+_BYTES_PER_TOK = KV_BYTES_PER_TOK   # EMA, refined by _update_bytes_per_tok
+
+
+def _used_bytes() -> int:
+    """Best estimate of this process's current resident footprint. Live RSS
+    when psutil is present (truest — unified memory includes GPU buffers),
+    else MLX's own active + pool counters."""
+    if _PROC is not None:
+        rss = _rss_bytes()
+        if rss is not None:
+            return rss
+    a = _mx_mem("get_active_memory") or 0
+    c = _mx_mem("get_cache_memory") or 0
+    return a + c
+
+
+def _est_kv_bytes(n_tokens: int) -> int:
+    return int(max(0, n_tokens) * _BYTES_PER_TOK)
+
+
+def _update_bytes_per_tok(active_before: Optional[int],
+                          active_after: Optional[int], n_tokens: int):
+    """Refine the per-token KV estimate from a real prefill's allocator delta.
+    EMA so one noisy sample (e.g. a chunk freed mid-prefill) can't whipsaw the
+    governor. Worker thread only."""
+    global _BYTES_PER_TOK
+    if active_before is None or active_after is None or n_tokens <= 0:
+        return
+    delta = active_after - active_before
+    if delta <= 0:
+        return
+    _BYTES_PER_TOK = 0.7 * _BYTES_PER_TOK + 0.3 * (delta / n_tokens)
+
+
+def _enforce_budget(target: "_Slot", n_prefill: int, snap_to: int):
+    """Evict LRU non-target slots until this request is projected to fit under
+    the budget. Raise MemoryBudgetExceeded if it still won't (strict), or warn
+    and proceed (QWEN_MEM_STRICT=0). No-op when no budget is set. Worker thread
+    only — it mutates _SLOTS and frees caches."""
+    if not MEM_BUDGET_BYTES:
+        return
+    # New memory this request adds: KV for the suffix we prefill into the slot,
+    # PLUS the live working COPY of the whole snapshot (snap_to tokens) that
+    # generation runs on — that copy is the transient peak that tips the box.
+    added = _est_kv_bytes(n_prefill) + _est_kv_bytes(snap_to)
+    projected = _used_bytes() + added
+    evicted = 0
+    if projected > MEM_BUDGET_BYTES:
+        victims = sorted((s for s in _SLOTS if s is not target and s.tokens),
+                         key=lambda x: x.last_used)
+        for s in victims:
+            if projected <= MEM_BUDGET_BYTES:
+                break
+            freed = _est_kv_bytes(len(s.tokens))
+            print(f"[qwen-server] governor: evicting slot={s.idx} "
+                  f"({len(s.tokens)}t ~{_gb(freed)}) to stay under budget")
+            s.reset()
+            _clear_metal_cache()
+            projected -= freed
+            evicted += 1
+    if projected > MEM_BUDGET_BYTES:
+        msg = (f"projected {_gb(projected)} over budget {MEM_BUDGET_GB:g}GB "
+               f"after evicting {evicted} slot(s) "
+               f"(prefill={n_prefill}t snapshot={snap_to}t, "
+               f"~{_gb(int(_BYTES_PER_TOK))}/tok)")
+        if MEM_STRICT:
+            raise MemoryBudgetExceeded(msg)
+        print(f"[qwen-server] governor WARNING (strict off, proceeding): {msg}")
+    elif evicted or MEM_LOG:
+        print(f"[qwen-server] governor: ok, projected {_gb(projected)} / "
+              f"{MEM_BUDGET_GB:g}GB (evicted {evicted}, "
+              f"~{_gb(int(_BYTES_PER_TOK))}/tok)")
+
+
 def _prefill(cache, toks: List[int]):
     """Feed tokens into the cache in chunks, no sampling. This is the manual
     equivalent of generate_step's prefill loop; we need it standalone so the
@@ -551,6 +736,30 @@ def _starts_in_think(prompt: str) -> bool:
     if last_open == -1:
         return False
     return prompt.find("</think>", last_open) == -1
+
+
+def _snapshot_boundary(prompt: str, tokens: List[int], start: int) -> int:
+    """Token index up to which the cache is snapshotted. Prefer the STRUCTURAL
+    marker: snapshot everything before the volatile per-turn block (default
+    "<context>"), so the boundary auto-fits however long the tail grows instead
+    of guessing a token count. Fall back to the fixed holdback when the marker
+    isn't present (e.g. Copilot side-requests with no context block).
+
+    The boundary is clamped to [start, n-1]: never before what we've already
+    reused, never the whole prompt (at least one token must remain to generate).
+    Re-encoding the prefix can differ from the full tokenization by a token at
+    the split, but the marker is newline-preceded so the boundary is stable in
+    practice, and a token of slack only means re-prefilling one extra token."""
+    n = len(tokens)
+    base = n - SNAPSHOT_HOLDBACK
+    if SNAPSHOT_MARKER:
+        idx = prompt.rfind(SNAPSHOT_MARKER)
+        if idx > 0:
+            try:
+                base = len(tok.encode(prompt[:idx]))
+            except Exception:
+                pass
+    return min(max(start, base), n - 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -744,13 +953,20 @@ def run_mlx(prompt: str, body: Dict[str, Any]):
 
     tokens: List[int] = tok.encode(prompt)
     n_prompt = len(tokens)
+    if MAX_CONTEXT and n_prompt > MAX_CONTEXT:
+        raise MemoryBudgetExceeded(
+            f"prompt {n_prompt}t exceeds QWEN_MAX_CONTEXT={MAX_CONTEXT}t")
     slot, start = _acquire_slot(tokens)
     if start == 0 and slot.tokens:
         slot.reset()   # stale snapshot that didn't match: start cold
 
-    # Snapshot point: everything except the volatile tail (generation prompt
-    # / "<think>" opener), so next turn's re-render still extends it cleanly.
-    snap_to = min(max(start, n_prompt - SNAPSHOT_HOLDBACK), n_prompt - 1)
+    # Snapshot point: cache up to the structural marker (everything before the
+    # volatile per-turn tail), falling back to the fixed holdback. Keeps the
+    # stable prefix cached while date/terminals/editor/request recompute fresh.
+    snap_to = _snapshot_boundary(prompt, tokens, start)
+    # Governor: make room (evicting LRU slots) or refuse, BEFORE we allocate
+    # this request's KV. Must run on the worker thread, which we are.
+    _enforce_budget(slot, max(0, snap_to - start), snap_to)
     pct = (100 * start // n_prompt) if n_prompt else 0
     print(f"[qwen-server] slot={slot.idx} prompt={n_prompt}t "
           f"kv-reuse={start}t ({pct}%) prefill={n_prompt - start}t")
@@ -766,8 +982,12 @@ def run_mlx(prompt: str, body: Dict[str, Any]):
 
     t0 = time.perf_counter()
     if snap_to > start:
+        _a_before = _mx_mem("get_active_memory")
         _prefill(slot.cache, tokens[start:snap_to])
         slot.tokens = tokens[:snap_to]
+        # Calibrate the per-token KV estimate from this real allocation delta.
+        _update_bytes_per_tok(_a_before, _mx_mem("get_active_memory"),
+                              snap_to - start)
     t1 = time.perf_counter()
     slot.last_used = time.time()
     # Generation runs on a COPY; the slot keeps the clean prompt-only state.
@@ -894,7 +1114,13 @@ async def chat_completions(request: Request):
                     content += txt
             return reasoning, content, tool_calls
 
-        reasoning, content, tool_calls = await asyncio.wrap_future(GPU.submit(generate_all))
+        try:
+            reasoning, content, tool_calls = await asyncio.wrap_future(GPU.submit(generate_all))
+        except MemoryBudgetExceeded as e:
+            print(f"[qwen-server] refused (memory budget): {e}")
+            return JSONResponse(status_code=503, content={"error": {
+                "message": str(e), "type": "memory_budget_exceeded",
+                "code": "context_too_large"}})
         _log_chat(cid, created, body, prompt, reasoning, content, tool_calls,
                   stream=False, duration_s=time.perf_counter() - t_req)
         message: Dict[str, Any] = {"role": "assistant",
@@ -923,7 +1149,7 @@ async def chat_completions(request: Request):
                 for delta in run_mlx(prompt, body):
                     q.put(("txt", delta))
             except Exception as e:
-                q.put(("err", repr(e)))
+                q.put(("err", f"{type(e).__name__}: {e}"))
             finally:
                 q.put(("end", None))
 
@@ -939,6 +1165,7 @@ async def chat_completions(request: Request):
         yield chunk({"role": "assistant"})
 
         errored = False
+        err_msg = ""
         while True:
             kind, val = q.get()
             if kind == "end":
@@ -946,6 +1173,7 @@ async def chat_completions(request: Request):
             if kind == "err":
                 print(f"[qwen-server] generation error: {val}")
                 errored = True
+                err_msg = val
                 break
             for ev_kind, txt in parser.feed(val):
                 (acc_reasoning if ev_kind == "reasoning" else acc_content).append(txt)
@@ -959,6 +1187,8 @@ async def chat_completions(request: Request):
                         else {"content": txt})
 
         if errored:
+            if err_msg:
+                yield chunk({"content": f"\n[server: {err_msg}]"})
             yield chunk({}, finish="stop")
         elif tool_calls:
             tc_delta = [{"index": i, **tc} for i, tc in enumerate(tool_calls)]
