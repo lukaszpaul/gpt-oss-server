@@ -653,18 +653,41 @@ def _state_arrays(cache_list) -> List["mx.array"]:
     return out
 
 
+def _independent_state(x):
+    """Rebuild a cache-state structure with FRESH containers and FRESH array
+    objects, so a copy shares no mutable state with its source.
+
+    Recurrent (linear-attn / ArraysCache) layers update their state list IN
+    PLACE during generation. A shallow `d.state = s.state` makes the copy share
+    that list, so generating on the copy would advance the SOURCE snapshot's
+    recurrent state — corrupting in-RAM reuse and, worse, any snapshot we then
+    persist to disk. Copying the arrays and containers breaks that aliasing.
+    (Verified by test_cache_roundtrip.py check 3.)"""
+    if isinstance(x, mx.array):
+        return mx.array(x)                       # new array object
+    if isinstance(x, list):
+        return [_independent_state(y) for y in x]
+    if isinstance(x, tuple):
+        return tuple(_independent_state(y) for y in x)
+    return x
+
+
 def _copy_cache(src):
-    """Independent copy of a prompt cache via the .state/.meta_state API —
+    """Fully INDEPENDENT copy of a prompt cache via the .state/.meta_state API —
     the same mechanism mlx_lm's cache (de)serialization uses, so it works for
-    (Quantized)KVCache and recurrent ArraysCache entries alike. Evaluated
-    immediately so the copy owns materialized data before the source mutates
-    further."""
+    (Quantized)KVCache and recurrent ArraysCache entries alike. The state is
+    deep-copied (_independent_state) so generation on the copy can never mutate
+    the source snapshot. Evaluated immediately so the copy owns materialized
+    data before the source mutates further."""
     dst = _make_cache()
     for s, d in zip(src, dst):
         try:
-            d.state = s.state
+            d.state = _independent_state(s.state)
         except Exception:
-            pass  # empty cache entries have no state to copy yet
+            try:
+                d.state = s.state                # fallback: never break gen
+            except Exception:
+                pass  # empty cache entries have no state to copy yet
         try:
             d.meta_state = s.meta_state
         except Exception:
