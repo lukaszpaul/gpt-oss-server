@@ -32,6 +32,7 @@ Results print as a table per config and are written to ./ab_results/<ts>.{json,c
 """
 
 import os
+import gc
 import sys
 import csv
 import json
@@ -104,6 +105,14 @@ def _clear():
 def _peak_gb():
     p = _mx("get_peak_memory")
     return (p / (1 << 30)) if p else 0.0
+
+
+def _active_gb():
+    """Currently-live MLX bytes (weights + caches + retained activations). Unlike
+    get_peak_memory this DROPS when caches are freed, so sampling it gives a
+    reliable PER-CELL footprint without depending on reset_peak_memory."""
+    a = _mx("get_active_memory")
+    return (a / (1 << 30)) if a else 0.0
 
 
 def _rss_gb():
@@ -180,25 +189,31 @@ def make_tokens(tok, n):
     return (ids * reps)[:n]
 
 
-def run_cell(model, tok, ctx_len, kv_bits, prefill_step, n_decode, group):
+def run_cell(model, tok, ctx_len, kv_bits, prefill_step, n_decode, group,
+             have_reset):
     toks = make_tokens(tok, ctx_len)
 
     _clear()
-    _reset_peak()
+    gc.collect()
+    if have_reset:
+        _reset_peak()
+    # Sample live (active) memory at each phase — this is the per-cell footprint
+    # that drops between cells, independent of reset_peak_memory.
+    samples = [_active_gb()]
 
     # Prefill (the snapshot build).
     t0 = time.perf_counter()
     last = prefill(model, model_cache := make_cache(model, kv_bits, group), toks,
                    prefill_step)
     t_prefill = time.perf_counter() - t0
-    peak_after_prefill = _peak_gb()
+    samples.append(_active_gb())
 
-    # Working copy — generation runs on this in the server, so the copy is part
-    # of the real peak.
+    # Working copy — generation runs on this in the server, so snapshot + copy
+    # are both live here: this is the dominant 2x footprint.
     tc = time.perf_counter()
     work = copy_cache(model, model_cache, kv_bits, group)
     t_copy = time.perf_counter() - tc
-    peak_after_copy = _peak_gb()
+    samples.append(_active_gb())
 
     # Decode n_decode tokens greedily on the copy; TTFT is end-to-end.
     logits = last
@@ -212,17 +227,21 @@ def run_cell(model, tok, ctx_len, kv_bits, prefill_step, n_decode, group):
         if step_i == 0:
             t_first = time.perf_counter()
     t_decode = time.perf_counter() - td
-    peak_final = _peak_gb()
+    samples.append(_active_gb())
 
     ttft = (t_first - t0) if t_first else float("nan")
     prefill_tps = ctx_len / t_prefill if t_prefill > 0 else 0.0
     decode_tps = (n_decode - 1) / (t_decode - (t_first - td)) \
         if (t_first and t_decode > (t_first - td)) else 0.0
 
-    peak = max(peak_after_prefill, peak_after_copy, peak_final)
+    live_peak = max(samples)                 # reliable per-cell footprint
+    true_peak = _peak_gb() if have_reset else 0.0   # incl. intra-op transient
+    peak = true_peak if have_reset else live_peak
     rss = _rss_gb()
 
     del model_cache, work
+    _clear()
+    gc.collect()
     _clear()
 
     return {
@@ -231,8 +250,10 @@ def run_cell(model, tok, ctx_len, kv_bits, prefill_step, n_decode, group):
         "ttft_s": round(ttft, 2),
         "decode_tps": round(decode_tps, 1),
         "peak_gb": round(peak, 2),
+        "live_gb": round(live_peak, 2),
         "rss_gb": round(rss, 2),
         "copy_s": round(t_copy, 2),
+        "peak_mode": "true" if have_reset else "live",
     }
 
 
@@ -257,10 +278,16 @@ def main():
 
     print(f"[ab] loading {args.model} ...")
     model, tok = load(args.model)
-    if not _reset_peak():
-        print("[ab] NOTE: reset_peak_memory unavailable — peak is GLOBAL "
-              "high-water, not per-cell (treat as an upper bound).")
-    print(f"[ab] weights resident: peak~{_peak_gb():.1f}GB rss~{_rss_gb():.1f}GB")
+    have_reset = _reset_peak()
+    if have_reset:
+        print("[ab] peak mode: TRUE per-cell peak (reset_peak_memory works) — "
+              "includes intra-op transients.")
+    else:
+        print("[ab] peak mode: LIVE footprint (reset_peak_memory unavailable). "
+              "Per-cell weights+KV+copy, sampled from active memory; EXCLUDES "
+              "the intra-op prefill transient, so leave ~2-4GB headroom.")
+    print(f"[ab] weights resident: active~{_active_gb():.1f}GB "
+          f"rss~{_rss_gb():.1f}GB")
     print(f"[ab] sweep: contexts={contexts} kv_bits={kv_bits_list} "
           f"prefill_steps={steps} decode={args.decode} limit={args.mem_limit}GB\n")
 
@@ -280,7 +307,7 @@ def main():
             sys.stdout.flush()
             try:
                 r = run_cell(model, tok, ctx, kv_bits, step, args.decode,
-                             args.kv_group)
+                             args.kv_group, have_reset)
             except Exception as e:
                 print(f"  ctx={ctx}: FAILED ({type(e).__name__}: {e})")
                 rows.append({"ctx": ctx, "kv_bits": kv_bits,
@@ -303,7 +330,8 @@ def main():
         json.dump({"model": args.model, "mem_limit_gb": args.mem_limit,
                    "decode": args.decode, "results": rows}, f, indent=2)
     cols = ["label", "ctx", "kv_bits", "prefill_step", "prefill_tps", "ttft_s",
-            "decode_tps", "peak_gb", "rss_gb", "copy_s", "error"]
+            "decode_tps", "peak_gb", "live_gb", "rss_gb", "copy_s", "peak_mode",
+            "error"]
     with open(cpath, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
