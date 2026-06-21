@@ -287,6 +287,21 @@ DISK_CACHE_MAX_BYTES = int(DISK_CACHE_MAX_GB * (1 << 30))
 # and the disk write + reload overhead wouldn't pay off.
 DISK_CACHE_MIN_TOKENS = int(os.environ.get("QWEN_DISK_CACHE_MIN_TOKENS", "2048"))
 
+# Front snapshot: persist the shared stable FRONT — everything up to the FIRST
+# <context> (system + tools + workspace_info + repoMap), which is byte-identical
+# across ALL conversations in a workspace. With this on, a BRAND-NEW chat
+# warm-loads that front from disk and prefills only its own turn, instead of
+# reprefilling the whole front. It's stored in the SAME on-disk store as the
+# disk cache and reloaded by the SAME exact-prefix match, so it's an independent
+# on/off you can A/B: it works even with QWEN_DISK_CACHE=0 (then ONLY fronts are
+# persisted, not full conversation snapshots). Default OFF; same round-trip
+# correctness caveat as QWEN_DISK_CACHE (run test_cache_roundtrip.py first).
+FRONT_SNAPSHOT = os.environ.get("QWEN_FRONT_SNAPSHOT", "0") == "1"
+
+# Either feature needs the on-disk store wired up (index bootstrap + prefix
+# lookup). Use this for the shared guards.
+_DISK_ON = DISK_CACHE or FRONT_SNAPSHOT
+
 # Global thinking kill-switch (same semantics as GGUF server).
 THINKING_DEFAULT = os.environ.get("QWEN_THINKING", "1") == "1"
 
@@ -494,14 +509,15 @@ if REPOMAP_ENABLED:
           f"multi-root, static map -> cached prefix, hint -> volatile tail")
 else:
     print("[qwen-server] repo map: OFF (set QWEN_REPOMAP=1 to enable)")
-if DISK_CACHE:
-    print(f"[qwen-server] disk cache: ON (dir={DISK_CACHE_DIR}, "
-          f"cap={('%gGB' % DISK_CACHE_MAX_GB) if DISK_CACHE_MAX_BYTES else 'none'}, "
-          f"min={DISK_CACHE_MIN_TOKENS}t) — idle snapshots spill to SSD, "
-          f"reload on return")
+if _DISK_ON:
+    print(f"[qwen-server] disk store: dir={DISK_CACHE_DIR}, "
+          f"cap={('%gGB' % DISK_CACHE_MAX_GB) if DISK_CACHE_MAX_BYTES else 'none'} — "
+          f"conversation spill={'ON' if DISK_CACHE else 'off'} "
+          f"(min={DISK_CACHE_MIN_TOKENS}t), "
+          f"front snapshot={'ON' if FRONT_SNAPSHOT else 'off'}")
 else:
-    print("[qwen-server] disk cache: OFF (set QWEN_DISK_CACHE=1 after "
-          "test_cache_roundtrip.py passes)")
+    print("[qwen-server] disk store: OFF (set QWEN_DISK_CACHE=1 and/or "
+          "QWEN_FRONT_SNAPSHOT=1 after test_cache_roundtrip.py passes)")
 
 app = FastAPI()
 
@@ -578,9 +594,10 @@ def _acquire_slot(tokens: List[int]) -> Tuple[_Slot, int]:
         if k > best_partial_k:
             best_partial, best_partial_k = s, k
 
-    # Disk-spilled snapshots: reload only when STRICTLY better than the best
-    # resident match — a disk read + eval is cheap vs reprefill, but not free.
-    if DISK_CACHE:
+    # Disk snapshots (spilled conversations AND/OR shared fronts): reload only
+    # when STRICTLY better than the best resident match — a disk read + eval is
+    # cheap vs reprefill, but not free.
+    if _DISK_ON:
         disk_entry, disk_len = _disk_find(tokens)
         if disk_entry is not None and disk_len > best_usable:
             slot = _recycle_slot(exclude=best)
@@ -857,7 +874,7 @@ def _disk_ensure_ready():
     if _DISK_READY:
         return
     _DISK_READY = True
-    if not DISK_CACHE:
+    if not _DISK_ON:
         return
     try:
         os.makedirs(DISK_CACHE_DIR, exist_ok=True)
@@ -912,11 +929,12 @@ def _disk_find(tokens: List[int]) -> Tuple[Optional[Dict[str, Any]], int]:
     return best, best_len
 
 
-def _disk_save_slot(slot: "_Slot"):
+def _disk_save_slot(slot: "_Slot", reason: str = "spilled"):
     """Serialize a slot's current snapshot to disk (skip tiny/dup). Captures the
-    slot at its deepest cached boundary (slot.tokens), so reload gives deep reuse
-    and a minimal suffix prefill. Worker thread only."""
-    if not DISK_CACHE:
+    slot at its current boundary (slot.tokens) — the deep boundary for an evicted
+    conversation, or the front boundary for a front snapshot — so reload gives
+    maximal reuse and a minimal suffix prefill. Worker thread only."""
+    if not _DISK_ON:
         return
     toks = slot.tokens
     if len(toks) < DISK_CACHE_MIN_TOKENS:
@@ -938,11 +956,11 @@ def _disk_save_slot(slot: "_Slot"):
             json.dump({"tokens": ent["tokens"], "nbytes": nbytes,
                        "last_used": ent["last_used"], "model": MODEL_ID}, f)
         _DISK_INDEX.append(ent)
-        print(f"[qwen-server] disk cache: spilled slot={slot.idx} "
+        print(f"[qwen-server] disk store: {reason} slot={slot.idx} "
               f"{len(toks)}t ({_gb(nbytes)}) key={key[:8]}")
         _disk_enforce_cap()
     except Exception as e:
-        print(f"[qwen-server] disk cache save failed: {e!r}")
+        print(f"[qwen-server] disk store save failed: {e!r}")
 
 
 def _disk_load_into(slot: "_Slot", entry: Dict[str, Any]) -> bool:
@@ -984,8 +1002,24 @@ def _disk_enforce_cap():
                 pass
         tot -= e["nbytes"]
         _DISK_INDEX.remove(e)
-        print(f"[qwen-server] disk cache: evicted {len(e['tokens'])}t "
+        print(f"[qwen-server] disk store: evicted {len(e['tokens'])}t "
               f"({_gb(e['nbytes'])}) key={e['key'][:8]}")
+
+
+def _front_boundary(prompt: str, tokens: List[int]) -> int:
+    """Token index of the FIRST snapshot marker — the end of the shared stable
+    front (system + tools + workspace_info + repoMap) that every conversation in
+    a workspace shares byte-for-byte. 0 when there's no marker (e.g. a
+    side-request with no <context> block), which disables front capture."""
+    if not SNAPSHOT_MARKER:
+        return 0
+    idx = prompt.find(SNAPSHOT_MARKER)
+    if idx <= 0:
+        return 0
+    try:
+        return len(tok.encode(prompt[:idx]))
+    except Exception:
+        return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -2053,6 +2087,18 @@ def run_mlx(prompt: str, body: Dict[str, Any]):
         processors.append(_presence_processor(presence))
 
     t0 = time.perf_counter()
+    # Front snapshot: on a TRUE cold start (no resident or disk prefix matched),
+    # prefill + persist the shared stable front (up to the FIRST <context>) so
+    # future brand-new chats in this workspace warm-load it instead of
+    # reprefilling. The remainder (front -> deep) is prefilled by the block
+    # below; advancing `start` to the front avoids redoing those tokens.
+    if FRONT_SNAPSHOT and start == 0:
+        front = _front_boundary(prompt, tokens)
+        if 0 < front < snap_to:
+            _prefill(slot.cache, tokens[:front])
+            slot.tokens = tokens[:front]
+            _disk_save_slot(slot, reason="front")
+            start = front
     if snap_to > start:
         _a_before = _mx_mem("get_active_memory")
         _prefill(slot.cache, tokens[start:snap_to])
