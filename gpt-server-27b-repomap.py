@@ -216,15 +216,39 @@ SORT_TOOLS = os.environ.get("QWEN_SORT_TOOLS", "1") == "1"
 # Format: JSON list of [pattern, replacement] pairs, e.g.
 #   QWEN_PIN='[["Current date: [^\\n]+", "Current date: 2026-01-01"]]'
 # Use the CACHE_DEBUG divergence log (cached:/new: lines) to find what to pin.
+# Built-in default pins for known Copilot per-chat churn that breaks prefix /
+# front-snapshot reuse. Each new chat embeds a session UUID (e.g. a scratch or
+# instructions folder path) inside the cached front; left alone it diverges the
+# prefix on every new chat and drops reuse to 0%. The pattern is anchored to a
+# path SEGMENT (UUID preceded by / or \) so it only neutralizes folder/file-name
+# UUIDs — the churn source — and leaves any inline UUID you might actually ask
+# about untouched. Disable with QWEN_PIN_DEFAULTS=0 (e.g. if a path UUID ever
+# matters to a task). Add more pairs here as the CACHE_DEBUG log reveals them.
+PIN_DEFAULTS_ON = os.environ.get("QWEN_PIN_DEFAULTS", "1") == "1"
+_DEFAULT_PINS: List[Tuple[str, str]] = [
+    (r"(?<=[/\\])[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+     "00000000-0000-0000-0000-000000000000"),
+]
+
 PIN_PATTERNS: List[Tuple["re.Pattern", str]] = []
+_n_default = 0
+if PIN_DEFAULTS_ON:
+    for _pat, _repl in _DEFAULT_PINS:
+        try:
+            PIN_PATTERNS.append((re.compile(_pat), _repl))
+            _n_default += 1
+        except Exception as _e:
+            print(f"[qwen-server] default pin compile failed, skipping: {_e!r}")
 _pin_raw = os.environ.get("QWEN_PIN", "")
 if _pin_raw:
     try:
         for _pat, _repl in json.loads(_pin_raw):
             PIN_PATTERNS.append((re.compile(_pat), _repl))
-        print(f"[qwen-server] prompt pinning: {len(PIN_PATTERNS)} pattern(s)")
     except Exception as _e:
         print(f"[qwen-server] QWEN_PIN parse failed, ignoring: {_e!r}")
+if PIN_PATTERNS:
+    print(f"[qwen-server] prompt pinning: {len(PIN_PATTERNS)} pattern(s) "
+          f"({_n_default} built-in + {len(PIN_PATTERNS) - _n_default} from QWEN_PIN)")
 
 # Optional: ask MLX to wire its GPU buffers (resists page eviction between
 # turns). Set to e.g. 56 (GB). Requires the sysctl above to be raised first.
