@@ -2134,18 +2134,26 @@ def run_mlx(prompt: str, body: Dict[str, Any]):
         processors.append(_presence_processor(presence))
 
     t0 = time.perf_counter()
-    # Front snapshot: on a TRUE cold start (no resident or disk prefix matched),
-    # prefill + persist the shared stable front (up to the FIRST <context>) so
-    # future brand-new chats in this workspace warm-load it instead of
-    # reprefilling. The remainder (front -> deep) is prefilled by the block
-    # below; advancing `start` to the front avoids redoing those tokens.
-    if FRONT_SNAPSHOT and start == 0:
-        front = _front_boundary(prompt, tokens)
-        if 0 < front < snap_to:
-            _prefill(slot.cache, tokens[:front])
-            slot.tokens = tokens[:front]
-            _disk_save_slot(slot, reason="front")
-            start = front
+    # Front snapshot: on a TRUE cold start, persist the shared stable front (up
+    # to the FIRST <context>: system + tools + workspace_info + repoMap) so the
+    # NEXT brand-new chat warm-loads it instead of reprefilling. Two cases:
+    #   - front < snap_to (cold resume of a multi-turn chat): prefill + save the
+    #     front, then continue front -> deep below (advancing `start`).
+    #   - front == snap_to (a turn-1 chat: a single <context>): the snapshot we
+    #     build below IS the front, so we save it explicitly afterward.
+    # Saving on EVERY cold start (not only when a turn-1 slot happens to be
+    # evicted bare) is what guarantees a front exists even after you go several
+    # turns deep in one chat before opening a new one. _disk_save_slot dedups by
+    # token hash, so a front already on disk is just touched, not rewritten.
+    cold = (start == 0)
+    front = _front_boundary(prompt, tokens) if (FRONT_SNAPSHOT and cold) else 0
+    saved_front = False
+    if 0 < front < snap_to:
+        _prefill(slot.cache, tokens[:front])
+        slot.tokens = tokens[:front]
+        _disk_save_slot(slot, reason="front")
+        saved_front = True
+        start = front
     if snap_to > start:
         _a_before = _mx_mem("get_active_memory")
         _prefill(slot.cache, tokens[start:snap_to])
@@ -2153,6 +2161,11 @@ def run_mlx(prompt: str, body: Dict[str, Any]):
         # Calibrate the per-token KV estimate from this real allocation delta.
         _update_bytes_per_tok(_a_before, _mx_mem("get_active_memory"),
                               snap_to - start)
+    # Turn-1 cold start: the snapshot we just built IS the shared front, so
+    # persist it now rather than waiting for the slot to be evicted (which may
+    # never leave a bare front once the chat goes deep).
+    if FRONT_SNAPSHOT and cold and not saved_front and 0 < snap_to <= front:
+        _disk_save_slot(slot, reason="front")
     t1 = time.perf_counter()
     slot.last_used = time.time()
     # Generation runs on a COPY; the slot keeps the clean prompt-only state.
