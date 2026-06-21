@@ -141,6 +141,8 @@ from mlx_lm.models.cache import (
     KVCache,
     make_prompt_cache,
     can_trim_prompt_cache,
+    save_prompt_cache,
+    load_prompt_cache,
 )
 
 from fastapi import FastAPI, Request
@@ -259,6 +261,31 @@ MAX_CONTEXT = int(os.environ.get("QWEN_MAX_CONTEXT", "0"))
 # measurement after every prefill, so this only matters for the first request
 # or two; the default is a conservative 8-bit-KV hybrid-attention figure.
 KV_BYTES_PER_TOK = float(os.environ.get("QWEN_KV_BYTES_PER_TOK", "70000"))
+
+# --- Disk-backed snapshot cache ------------------------------------------- #
+# Spill idle conversation snapshots to SSD instead of discarding them when a
+# slot is recycled for a different conversation, and reload them on return.
+# Switching back to an old chat then costs a disk read + a tiny suffix prefill
+# instead of a full ~30k-token reprefill. RAM still holds only the live working
+# set (CACHE_SLOTS resident slots); the heavy KV lives on disk, and only a small
+# token-ledger index stays in memory for prefix matching (~4 B/token).
+#
+# DEFAULT OFF. Correctness depends on save_prompt_cache/load_prompt_cache
+# reproducing THIS model's quantized-KV + recurrent (hybrid-attention) cache
+# state exactly; a bad round-trip corrupts context SILENTLY (garbage output, not
+# a cache miss). Run test_cache_roundtrip.py on the target machine first, then
+# set QWEN_DISK_CACHE=1. Single-model deployment -> no model/version
+# invalidation needed; a stale ledger simply fails the exact-prefix test and is
+# ignored.
+DISK_CACHE = os.environ.get("QWEN_DISK_CACHE", "0") == "1"
+DISK_CACHE_DIR = os.environ.get("QWEN_DISK_CACHE_DIR",
+                                os.path.join(os.getcwd(), "cachesnaps"))
+# Total disk budget for spilled snapshots (GB); oldest evicted past it. 0 = off.
+DISK_CACHE_MAX_GB = float(os.environ.get("QWEN_DISK_CACHE_MAX_GB", "100"))
+DISK_CACHE_MAX_BYTES = int(DISK_CACHE_MAX_GB * (1 << 30))
+# Don't spill snapshots shorter than this — reprefilling them is already cheap,
+# and the disk write + reload overhead wouldn't pay off.
+DISK_CACHE_MIN_TOKENS = int(os.environ.get("QWEN_DISK_CACHE_MIN_TOKENS", "2048"))
 
 # Global thinking kill-switch (same semantics as GGUF server).
 THINKING_DEFAULT = os.environ.get("QWEN_THINKING", "1") == "1"
@@ -467,6 +494,14 @@ if REPOMAP_ENABLED:
           f"multi-root, static map -> cached prefix, hint -> volatile tail")
 else:
     print("[qwen-server] repo map: OFF (set QWEN_REPOMAP=1 to enable)")
+if DISK_CACHE:
+    print(f"[qwen-server] disk cache: ON (dir={DISK_CACHE_DIR}, "
+          f"cap={('%gGB' % DISK_CACHE_MAX_GB) if DISK_CACHE_MAX_BYTES else 'none'}, "
+          f"min={DISK_CACHE_MIN_TOKENS}t) — idle snapshots spill to SSD, "
+          f"reload on return")
+else:
+    print("[qwen-server] disk cache: OFF (set QWEN_DISK_CACHE=1 after "
+          "test_cache_roundtrip.py passes)")
 
 app = FastAPI()
 
@@ -526,7 +561,11 @@ def _log_divergence(slot: "_Slot", tokens: List[int], k: int):
 def _acquire_slot(tokens: List[int]) -> Tuple[_Slot, int]:
     """Pick the slot whose snapshot is the longest EXACT prefix of the new
     prompt. A partially-matching snapshot is unusable for a recurrent state
-    (no rollback), so it counts as zero. Worker thread only."""
+    (no rollback), so it counts as zero. When QWEN_DISK_CACHE is on, also
+    consider disk-spilled snapshots: if one is a longer exact prefix than any
+    resident slot, recycle a slot (spilling its current snapshot to disk first)
+    and reload the disk snapshot into it. Worker thread only."""
+    _disk_ensure_ready()
     best, best_usable = None, 0
     best_partial, best_partial_k = None, -1
     for s in _SLOTS:
@@ -538,17 +577,43 @@ def _acquire_slot(tokens: List[int]) -> Tuple[_Slot, int]:
             best, best_usable = s, usable
         if k > best_partial_k:
             best_partial, best_partial_k = s, k
+
+    # Disk-spilled snapshots: reload only when STRICTLY better than the best
+    # resident match — a disk read + eval is cheap vs reprefill, but not free.
+    if DISK_CACHE:
+        disk_entry, disk_len = _disk_find(tokens)
+        if disk_entry is not None and disk_len > best_usable:
+            slot = _recycle_slot(exclude=best)
+            if _disk_load_into(slot, disk_entry):
+                print(f"[qwen-server] slot={slot.idx} warm-loaded {disk_len}t "
+                      f"from disk (key={disk_entry['key'][:8]})")
+                return slot, disk_len
+            # load failed: fall through to the RAM/cold path
+
     if best is not None:
         return best, best_usable
     if CACHE_DEBUG and best_partial is not None:
         _log_divergence(best_partial, tokens, best_partial_k)
+    return _recycle_slot(exclude=None), 0
+
+
+def _recycle_slot(exclude: Optional["_Slot"]) -> "_Slot":
+    """Return a slot ready for a fresh (cold or disk-loaded) snapshot. Prefer a
+    not-yet-created slot; else evict the LRU slot — spilling its snapshot to disk
+    first (QWEN_DISK_CACHE) so switching back to that conversation later is a
+    reload, not a reprefill. Worker thread only."""
     if len(_SLOTS) < CACHE_SLOTS:
         s = _Slot(len(_SLOTS))
         _SLOTS.append(s)
-        return s, 0
-    s = min(_SLOTS, key=lambda x: x.last_used)   # LRU recycle, cold start
-    s.reset()
-    return s, 0
+        return s
+    victim = min((s for s in _SLOTS if s is not exclude),
+                 key=lambda x: x.last_used, default=None)
+    if victim is None:                       # only slot is `exclude`
+        victim = min(_SLOTS, key=lambda x: x.last_used)
+    if DISK_CACHE and victim.tokens:
+        _disk_save_slot(victim)
+    victim.reset()
+    return victim
 
 
 def _state_arrays(cache_list) -> List["mx.array"]:
@@ -756,6 +821,171 @@ def _prefill(cache, toks: List[int]):
             mx.eval(arrs)
         _clear_metal_cache()
         i += PREFILL_STEP
+
+
+# --------------------------------------------------------------------------- #
+# Disk-backed snapshot store — spill idle conversation caches to SSD
+#
+# RAM holds only the live working set (CACHE_SLOTS slots). When a slot is
+# recycled for a DIFFERENT conversation, its snapshot is serialized to disk
+# (save_prompt_cache) instead of discarded, keyed by a hash of its exact token
+# ledger. A later request whose prompt is an exact prefix-superset of that
+# ledger reloads it (load_prompt_cache, safetensors mmap -> bound by SSD
+# bandwidth, not reprefill compute) and prefills only the new suffix.
+#
+# The ledger index lives in RAM (one int list per saved snapshot); the heavy KV
+# stays on disk until a request needs it, plus a small sidecar JSON per snapshot
+# so the index survives restarts. All access is from the single GPU worker
+# thread (serialized) -> no locking.
+# --------------------------------------------------------------------------- #
+
+# RAM index: list of {"tokens": List[int], "key": str, "nbytes": int,
+#                     "last_used": float}. Heavy KV is the matching .safetensors.
+_DISK_INDEX: List[Dict[str, Any]] = []
+_DISK_READY = False
+
+
+def _disk_paths(key: str) -> Tuple[str, str]:
+    base = os.path.join(DISK_CACHE_DIR, key)
+    return base + ".safetensors", base + ".json"
+
+
+def _disk_ensure_ready():
+    """Rebuild the RAM ledger index from sidecar JSONs on first use (survives
+    server restarts). Reads only the small sidecars, never the heavy caches."""
+    global _DISK_READY
+    if _DISK_READY:
+        return
+    _DISK_READY = True
+    if not DISK_CACHE:
+        return
+    try:
+        os.makedirs(DISK_CACHE_DIR, exist_ok=True)
+        for fn in os.listdir(DISK_CACHE_DIR):
+            if not fn.endswith(".json"):
+                continue
+            key = fn[:-5]
+            st_path, js_path = _disk_paths(key)
+            if not os.path.exists(st_path):
+                continue
+            try:
+                with open(js_path, encoding="utf-8") as f:
+                    d = json.load(f)
+                toks = d.get("tokens")
+                if not toks:
+                    continue
+                _DISK_INDEX.append({
+                    "tokens": toks, "key": key,
+                    "nbytes": int(d.get("nbytes", os.path.getsize(st_path))),
+                    "last_used": float(d.get("last_used", 0.0)),
+                })
+            except Exception:
+                continue
+        if _DISK_INDEX:
+            tot = sum(e["nbytes"] for e in _DISK_INDEX)
+            print(f"[qwen-server] disk cache: loaded {len(_DISK_INDEX)} "
+                  f"snapshot(s) from {DISK_CACHE_DIR} (~{_gb(tot)})")
+    except Exception as e:
+        print(f"[qwen-server] disk cache bootstrap failed: {e!r}")
+
+
+def _disk_key(tokens: List[int]) -> str:
+    h = hashlib.sha256()
+    h.update(str(len(tokens)).encode())
+    h.update(b"\0")
+    h.update(",".join(map(str, tokens)).encode())
+    return h.hexdigest()[:32]
+
+
+def _disk_find(tokens: List[int]) -> Tuple[Optional[Dict[str, Any]], int]:
+    """Longest disk snapshot whose ledger is an EXACT prefix of `tokens` (and
+    strictly shorter, so at least one token remains to prefill/generate)."""
+    best, best_len = None, 0
+    n = len(tokens)
+    for e in _DISK_INDEX:
+        led = e["tokens"]
+        m = len(led)
+        if m <= best_len or m >= n:
+            continue
+        if led == tokens[:m]:
+            best, best_len = e, m
+    return best, best_len
+
+
+def _disk_save_slot(slot: "_Slot"):
+    """Serialize a slot's current snapshot to disk (skip tiny/dup). Captures the
+    slot at its deepest cached boundary (slot.tokens), so reload gives deep reuse
+    and a minimal suffix prefill. Worker thread only."""
+    if not DISK_CACHE:
+        return
+    toks = slot.tokens
+    if len(toks) < DISK_CACHE_MIN_TOKENS:
+        return
+    key = _disk_key(toks)
+    for e in _DISK_INDEX:
+        if e["key"] == key:
+            e["last_used"] = time.time()     # already on disk; just touch
+            return
+    st_path, js_path = _disk_paths(key)
+    try:
+        os.makedirs(DISK_CACHE_DIR, exist_ok=True)
+        save_prompt_cache(st_path, slot.cache,
+                          metadata={"n": str(len(toks)), "model": MODEL_ID})
+        nbytes = os.path.getsize(st_path)
+        ent = {"tokens": list(toks), "key": key, "nbytes": nbytes,
+               "last_used": time.time()}
+        with open(js_path, "w", encoding="utf-8") as f:
+            json.dump({"tokens": ent["tokens"], "nbytes": nbytes,
+                       "last_used": ent["last_used"], "model": MODEL_ID}, f)
+        _DISK_INDEX.append(ent)
+        print(f"[qwen-server] disk cache: spilled slot={slot.idx} "
+              f"{len(toks)}t ({_gb(nbytes)}) key={key[:8]}")
+        _disk_enforce_cap()
+    except Exception as e:
+        print(f"[qwen-server] disk cache save failed: {e!r}")
+
+
+def _disk_load_into(slot: "_Slot", entry: Dict[str, Any]) -> bool:
+    """Load a disk snapshot into `slot` (cache + token ledger). mmap-backed:
+    arrays page in lazily and are materialized by the mx.eval. Returns True on
+    success, False (and leaves the slot reset) on any load error."""
+    st_path, _ = _disk_paths(entry["key"])
+    try:
+        cache = load_prompt_cache(st_path)
+        slot.cache = cache
+        slot.tokens = list(entry["tokens"])
+        arrs = _state_arrays(slot.cache)
+        if arrs:
+            mx.eval(arrs)
+        entry["last_used"] = time.time()
+        return True
+    except Exception as e:
+        print(f"[qwen-server] disk cache load failed ({entry['key'][:8]}): {e!r}")
+        slot.reset()
+        return False
+
+
+def _disk_enforce_cap():
+    """Evict oldest snapshots (safetensors + sidecar + index entry) until total
+    bytes fall under QWEN_DISK_CACHE_MAX_GB. No-op when the cap is 0."""
+    if not DISK_CACHE_MAX_BYTES:
+        return
+    tot = sum(e["nbytes"] for e in _DISK_INDEX)
+    if tot <= DISK_CACHE_MAX_BYTES:
+        return
+    for e in sorted(_DISK_INDEX, key=lambda x: x["last_used"]):
+        if tot <= DISK_CACHE_MAX_BYTES:
+            break
+        st_path, js_path = _disk_paths(e["key"])
+        for p in (st_path, js_path):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        tot -= e["nbytes"]
+        _DISK_INDEX.remove(e)
+        print(f"[qwen-server] disk cache: evicted {len(e['tokens'])}t "
+              f"({_gb(e['nbytes'])}) key={e['key'][:8]}")
 
 
 # --------------------------------------------------------------------------- #
