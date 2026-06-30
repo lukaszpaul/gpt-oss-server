@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Local IDE</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header id="topbar">
+    <span class="brand">⌁ local-ide</span>
+    <input id="folder-input" type="text" placeholder="/Users/you/path/to/project" spellcheck="false" />
+    <button id="open-btn">Open folder</button>
+    <span id="ws-name" class="muted"></span>
+    <span class="spacer"></span>
+    <span id="model-status" class="status">model: …</span>
+  </header>
+
+  <main id="layout">
+    <!-- File explorer -->
+    <section id="explorer" class="pane">
+      <div class="pane-head">Explorer</div>
+      <ul id="tree" class="tree"></ul>
+    </section>
+
+    <div class="divider"></div>
+
+    <!-- Editor -->
+    <section id="editor-pane" class="pane">
+      <div class="pane-head">
+        <span id="editor-title" class="muted">No file open</span>
+        <span class="spacer"></span>
+        <span id="dirty-dot" class="dirty hidden">●</span>
+        <button id="save-btn" disabled>Save</button>
+      </div>
+      <textarea id="editor" spellcheck="false" placeholder="Open a file from the explorer…"></textarea>
+    </section>
+
+    <div class="divider"></div>
+
+    <!-- Chat -->
+    <section id="chat-pane" class="pane">
+      <div class="pane-head">
+        <div id="mode-toggle" class="toggle">
+          <button data-mode="ask" class="active">ASK</button>
+          <button data-mode="agent">AGENT</button>
+        </div>
+        <span class="spacer"></span>
+        <button id="reset-btn" class="ghost" title="Clear conversation">Reset</button>
+      </div>
+      <div id="messages" class="messages"></div>
+      <div id="composer">
+        <textarea id="chat-input" rows="3" placeholder="Ask about the code… (Enter to send, Shift+Enter for newline)"></textarea>
+        <div class="composer-row">
+          <span id="mode-hint" class="muted">ASK · read-only</span>
+          <span class="spacer"></span>
+          <button id="cancel-btn" class="ghost hidden">Cancel</button>
+          <button id="send-btn">Send</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
