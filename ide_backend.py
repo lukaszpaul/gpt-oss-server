@@ -458,6 +458,17 @@ async def run_agent(ws: WebSocket, sess: Session, data: Dict[str, Any]) -> None:
 app = FastAPI()
 
 
+@app.middleware("http")
+async def no_cache_frontend(request: Request, call_next):
+    """Never let the browser cache the HTML/JS/CSS — during active development a
+    stale cached app.js is a classic source of 'the button does nothing'."""
+    resp = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.endswith((".html", ".js", ".css")):
+        resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     await fetch_model_id()

@@ -65,13 +65,21 @@ async function refreshHealth() {
 // --------------------------------------------------------------------------
 async function openFolder() {
   const path = $("#folder-input").value.trim();
-  if (!path) return;
-  const r = await fetch("/api/open", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path }),
-  });
-  const data = await r.json();
+  if (!path) { alert("Type a folder path in the box first."); return; }
+  let r, data;
+  try {
+    r = await fetch("/api/open", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    data = await r.json();
+  } catch (err) {
+    alert("Could not reach the backend.\n\nMake sure you opened this page at " +
+          "http://127.0.0.1:8001 (served by ide_backend.py) — not the file " +
+          "directly or a preview panel.\n\n(" + err + ")");
+    return;
+  }
   if (!r.ok) { alert(data.error || "Could not open folder"); return; }
   $("#ws-name").textContent = data.root;
   const tree = $("#tree");
